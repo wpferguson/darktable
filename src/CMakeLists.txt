@@ -1,4 +1,13 @@
 add_subdirectory(external)
+if(USE_AI)
+  find_package(ONNXRuntime QUIET)
+  if(NOT ONNXRuntime_FOUND)
+    message(FATAL_ERROR "ONNX Runtime not found")
+  endif()
+endif()
+if(USE_AI)
+  add_subdirectory(ai)
+endif(USE_AI)
 
 include(CheckCSourceCompiles)
 include(CheckCXXSymbolExists)
@@ -74,6 +83,7 @@ FILE(GLOB SOURCE_FILES
   "common/presets.c"
   "common/pwstorage/backend_kwallet.c"
   "common/pwstorage/pwstorage.c"
+  "common/ras2vect.c"
   "common/ratings.c"
   "common/resource_limits.c"
   "common/selection.c"
@@ -147,6 +157,7 @@ FILE(GLOB SOURCE_FILES
   "gui/preferences.c"
   "gui/presets.c"
   "gui/splash.c"
+  "gui/welcome.c"
   "gui/styles_dialog.c"
   "imageio/imageio.c"
   "imageio/imageio_jpeg.c"
@@ -307,6 +318,10 @@ include_directories(SYSTEM ${LIBXML2_INCLUDE_DIR})
 list(APPEND LIBS ${LIBXML2_LIBRARIES})
 add_definitions(${LIBXML2_DEFINITIONS})
 
+# Check for potrace
+find_package(Potrace REQUIRED)
+list(APPEND LIBS ${POTRACE_LIBRARY})
+
 if(USE_CAMERA_SUPPORT)
   find_package(Gphoto2 2.5)
   if(Gphoto2_FOUND)
@@ -438,6 +453,30 @@ foreach(lib ${OUR_LIBS} GIO GThread GModule PangoCairo Rsvg2 PNG JPEG TIFF LCMS2
   add_definitions(${${lib}_DEFINITIONS})
 endforeach(lib)
 
+if(USE_AI)
+  option(USE_AI_DOWNLOAD "Enable downloading AI models from repository" ON)
+
+  list(APPEND LIBS darktable_ai)
+
+  FILE(GLOB SOURCE_FILES_AI
+    "common/ai_models.c"
+    "common/ai/segmentation.c"
+    "common/ai/restore.c"
+    "develop/masks/object.c"
+    "gui/preferences_ai.c"
+  )
+  set(SOURCES ${SOURCES} ${SOURCE_FILES_AI})
+  add_definitions("-DHAVE_AI")
+  if(USE_AI_DOWNLOAD)
+    add_definitions("-DHAVE_AI_DOWNLOAD")
+    message(STATUS "AI features: enabled (with model download)")
+  else()
+    message(STATUS "AI features: enabled (without model download)")
+  endif()
+else(USE_AI)
+  message(STATUS "AI features: disabled")
+endif(USE_AI)
+
 if(PNG_VERSION_STRING VERSION_LESS 1.5)
   message(FATAL_ERROR "libpng version 1.5 or newer is required")
 endif()
@@ -445,6 +484,30 @@ endif()
 # Use imported target for curl
 find_package(CURL 7.56 REQUIRED)
 list(APPEND LIBS CURL::libcurl)
+
+if(USE_AI)
+  # libarchive for AI model ZIP extraction
+  # On macOS with Homebrew, libarchive is keg-only
+  if(APPLE)
+    execute_process(
+      COMMAND brew --prefix libarchive
+      OUTPUT_VARIABLE HOMEBREW_LIBARCHIVE_PREFIX
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+      RESULT_VARIABLE HOMEBREW_LIBARCHIVE_RESULT
+    )
+    if(HOMEBREW_LIBARCHIVE_RESULT EQUAL 0 AND EXISTS "${HOMEBREW_LIBARCHIVE_PREFIX}")
+      list(APPEND CMAKE_PREFIX_PATH "${HOMEBREW_LIBARCHIVE_PREFIX}")
+    endif()
+  endif()
+  find_package(LibArchive)
+  if(NOT LibArchive_FOUND)
+    message(FATAL_ERROR "libarchive not found")
+  else()
+    include_directories(SYSTEM ${LibArchive_INCLUDE_DIRS})
+    list(APPEND LIBS ${LibArchive_LIBRARIES})
+  endif()
+endif(USE_AI)
 
 # Require exiv2 >= 0.27.2 to make sure everything we need is available
 find_package(Exiv2 0.27.2 REQUIRED)
@@ -653,7 +716,7 @@ if(NOT CUSTOM_CFLAGS)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${MARCH} ${DT_REQ_INSTRUCTIONS} -g")
   set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -O2 -ftree-vectorize")
   set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -ffast-math -fno-finite-math-only")
-  if(CMAKE_COMPILER_IS_GNUCC)
+  if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     if(BUILD_SSE2_CODEPATHS)
       set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mfpmath=sse")
     endif()
@@ -667,7 +730,7 @@ if(NOT CUSTOM_CFLAGS)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${MARCH} ${DT_REQ_INSTRUCTIONS} -g")
   set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O2 -ftree-vectorize")
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -ffast-math -fno-finite-math-only")
-  if(CMAKE_COMPILER_IS_GNUCXX)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     if(BUILD_SSE2_CODEPATHS)
       set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfpmath=sse")
     endif()
@@ -713,8 +776,7 @@ if(USE_LUA)
     list(APPEND LIBS ${Lua54_LDFLAGS})
   else()
     if(DONT_USE_INTERNAL_LUA)
-      message(STATUS "Lua support: System library for lua 5.4 not found (to use darktable's version use -DDONT_USE_INTERNAL_LUA=Off)")
-      set(USE_LUA OFF)
+      message(FATAL_ERROR "Lua support: System library for Lua 5.4 not found (to use darktable's version add -DDONT_USE_INTERNAL_LUA=Off)")
     else(DONT_USE_INTERNAL_LUA)
       message(STATUS "Lua support: System library not found (using darktable's version)")
       include_directories(${CMAKE_CURRENT_SOURCE_DIR}/external/lua/src)
@@ -930,7 +992,7 @@ file(GLOB darktable_STYLES
 add_custom_command(
   DEPENDS ${darktable_STYLES} ${CMAKE_SOURCE_DIR}/tools/generate_styles_string.sh
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/styles_string.h
-  COMMAND ${CMAKE_SOURCE_DIR}/tools/generate_styles_string.sh ${DARKTABLE_DATADIR}/styles ${CMAKE_CURRENT_BINARY_DIR}/styles_string.h
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tools/generate_styles_string.sh ${DARKTABLE_DATADIR}/styles ${CMAKE_CURRENT_BINARY_DIR}/styles_string.h
   COMMENT "Generating styles strings for translation"
 )
 
@@ -972,6 +1034,15 @@ add_dependencies(lib_darktable generate_authors_h)
 if(APPLE)
   set_target_properties(lib_darktable PROPERTIES MACOSX_RPATH TRUE)
 endif(APPLE)
+if(NOT WIN32)
+  # lib_darktable and ONNX Runtime are installed to the same directory
+  # (${CMAKE_INSTALL_LIBDIR}/darktable/) — set RPATH so the linker finds it
+  set_target_properties(lib_darktable PROPERTIES INSTALL_RPATH "${RPATH_ORIGIN}")
+endif()
+if(WIN32)
+  # Export all symbols on Windows so modules can access library functions
+  set_target_properties(lib_darktable PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+endif(WIN32)
 set_target_properties(lib_darktable PROPERTIES OUTPUT_NAME darktable)
 set_target_properties(lib_darktable PROPERTIES LINKER_LANGUAGE C)
 

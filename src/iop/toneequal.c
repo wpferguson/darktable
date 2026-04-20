@@ -415,7 +415,7 @@ int legacy_params(dt_iop_module_t *self,
 
     // New params
     n->quantization = 0.0f;
-    n->smoothing = sqrtf(2.0f);
+    n->smoothing = M_SQRT2_F;
 
     *new_params = n;
     *new_params_size = sizeof(dt_iop_toneequalizer_params_v2_t);
@@ -472,7 +472,7 @@ void init_presets(dt_iop_module_so_t *self)
   p.exposure_boost = -0.5f;
   p.feathering = 1.0f;
   p.iterations = 1;
-  p.smoothing = sqrtf(2.0f);
+  p.smoothing = M_SQRT2_F;
   p.quantization = 0.0f;
 
   // Init exposure settings
@@ -1339,7 +1339,7 @@ static void gui_cache_init(dt_iop_module_t *self)
   g->thumb_preview_hash = DT_INVALID_HASH;
   g->max_histogram = 1;
   g->scale = 1.0f;
-  g->sigma = sqrtf(2.0f);
+  g->sigma = M_SQRT2_F;
   g->mask_display = FALSE;
 
   g->interpolation_valid = FALSE;  // TRUE if the interpolation_matrix is ready
@@ -1544,14 +1544,14 @@ static inline gboolean update_curve_lut(dt_iop_module_t *self)
   {
     float factors[CHANNELS] DT_ALIGNED_ARRAY;
     dt_simd_memcpy(g->temp_user_params, factors, CHANNELS);
-    valid = pseudo_solve(g->interpolation_matrix, factors, CHANNELS, PIXEL_CHAN, TRUE);
+    valid = pseudo_solve(g->interpolation_matrix, factors, CHANNELS, PIXEL_CHAN, FALSE);
     if(valid) dt_simd_memcpy(factors, g->factors, PIXEL_CHAN);
-    else dt_print(DT_DEBUG_PIPE, "tone equalizer pseudo solve problem");
-    g->factors_valid = TRUE;
+
+    g->factors_valid = valid;
     g->lut_valid = FALSE;
   }
 
-  if(!g->lut_valid && g->factors_valid)
+  if(!g->lut_valid) // && g->factors_valid)
   {
     compute_lut_correction(g, 0.5f, 4.0f);
     g->lut_valid = TRUE;
@@ -1631,7 +1631,7 @@ void commit_params(dt_iop_module_t *self,
 
     float A[CHANNELS * PIXEL_CHAN] DT_ALIGNED_ARRAY;
     build_interpolation_matrix(A, p->smoothing);
-    pseudo_solve(A, factors, CHANNELS, PIXEL_CHAN, FALSE);
+    pseudo_solve(A, factors, CHANNELS, PIXEL_CHAN, TRUE);
 
     dt_simd_memcpy(factors, d->factors, PIXEL_CHAN);
   }
@@ -1721,7 +1721,7 @@ void gui_update(dt_iop_module_t *self)
   const dt_iop_toneequalizer_gui_data_t *g = self->gui_data;
   const dt_iop_toneequalizer_params_t *p = self->params;
 
-  dt_bauhaus_slider_set(g->smoothing, logf(p->smoothing) / logf(sqrtf(2.0f)) - 1.0f);
+  dt_bauhaus_slider_set(g->smoothing, logf(p->smoothing) / logf(M_SQRT2_F) - 1.0f);
 
   show_guiding_controls(self);
   invalidate_luminance_cache(self);
@@ -1762,7 +1762,7 @@ static void smoothing_callback(GtkWidget *slider, dt_iop_module_t *self)
   dt_iop_toneequalizer_params_t *p = self->params;
   const dt_iop_toneequalizer_gui_data_t *g = self->gui_data;
 
-  p->smoothing= powf(sqrtf(2.0f), 1.0f +  dt_bauhaus_slider_get(slider));
+  p->smoothing= powf(M_SQRT2_F, 1.0f +  dt_bauhaus_slider_get(slider));
 
   float factors[CHANNELS] DT_ALIGNED_ARRAY;
   get_channels_factors(factors, p);
@@ -2010,7 +2010,7 @@ static void switch_cursors(dt_iop_module_t *self)
   {
     // if pipe is clean and idle and cursor is on preview,
     // hide GTK cursor because we display our custom one
-    dt_control_change_cursor(GDK_BLANK_CURSOR);
+    dt_control_change_cursor("none");
     dt_control_hinter_message(_("scroll over image to change tone exposure\n"
                                 "shift+scroll for large steps; "
                                 "ctrl+scroll for small steps"));
@@ -2135,7 +2135,7 @@ static inline gboolean set_new_params_interactive(const float control_exposure,
   float factors[CHANNELS] DT_ALIGNED_ARRAY;
   dt_simd_memcpy(g->temp_user_params, factors, CHANNELS);
   if(g->user_param_valid)
-    g->user_param_valid = pseudo_solve(g->interpolation_matrix, factors, CHANNELS, PIXEL_CHAN, TRUE);
+    g->user_param_valid = pseudo_solve(g->interpolation_matrix, factors, CHANNELS, PIXEL_CHAN, FALSE);
   if(!g->user_param_valid)
     dt_control_log(_("the interpolation is unstable, decrease the curve smoothing"));
 
@@ -2835,7 +2835,11 @@ static gboolean area_draw(GtkWidget *widget,
   if(g->lut_valid)
   {
     // draw the interpolation curve
-    set_color(g->cr, darktable.bauhaus->graph_fg);
+    if(g->factors_valid)
+      set_color(g->cr,  darktable.bauhaus->graph_fg);
+    else
+      cairo_set_source_rgb(g->cr, 0.75, .5, 0.);
+
     cairo_move_to(g->cr, 0, g->gui_lut[0] * g->graph_height);
     cairo_set_line_width(g->cr, DT_PIXEL_APPLY_DPI(3));
 
@@ -2893,7 +2897,7 @@ static gboolean area_draw(GtkWidget *widget,
   {
     if(g->area_cursor_valid)
     {
-      const float radius = g->sigma * g->graph_width / 8.0f / sqrtf(2.0f);
+      const float radius = g->sigma * g->graph_width / 8.0f / M_SQRT2_F;
       cairo_set_line_width(g->cr, DT_PIXEL_APPLY_DPI(1.5));
       const float y =
         g->gui_lut[(int)CLAMP(((UI_SAMPLES - 1) * g->area_x / g->graph_width),

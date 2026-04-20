@@ -47,6 +47,7 @@
 #include "dtgtk/thumbtable.h"
 #include "gui/accelerators.h"
 #include "gui/color_picker_proxy.h"
+#include "gui/drag_and_drop.h"
 #include "gui/gtk.h"
 #include "gui/guides.h"
 #include "gui/presets.h"
@@ -85,6 +86,7 @@ static void _dev_change_image(dt_develop_t *dev, const dt_imgid_t imgid);
 
 static void _darkroom_display_second_window(dt_develop_t *dev);
 static void _darkroom_ui_second_window_write_config(GtkWidget *widget);
+static void _darkroom_ui_second_window_cleanup(dt_develop_t *dev);
 
 const char *name(const dt_view_t *self)
 {
@@ -131,6 +133,50 @@ static void _get_zoom_pos(dt_dev_viewport_t *port,
   }
 }
 
+/* Compute the correction (zoom_x_preview - zoom_x_full) to add to a full-pipe
+   normalized zoom position to get the equivalent preview-pipe position.
+   Mask overlay points live in preview-pipe output space while _get_zoom_pos()
+   and dt_dev_get_viewport_params() use the full pipe; applying this correction
+   makes mouse positions match mask point coordinates when crop (or similar
+   modules) rounds pixel counts differently in the two pipes. */
+static void _preview_pipe_zoom_correction(dt_develop_t *dev, float *cx, float *cy)
+{
+  *cx = *cy = 0.f;
+  if(!dev->preview_pipe || !dev->full.pipe) return;
+
+  const float full_iw = (float)dev->full.pipe->iwidth;
+  const float full_ih = (float)dev->full.pipe->iheight;
+  if(full_iw <= 0 || full_ih <= 0) return;
+
+  const float pp_wd   = (float)dev->preview_pipe->processed_width;
+  const float pp_ht   = (float)dev->preview_pipe->processed_height;
+  const float full_wd = (float)dev->full.pipe->processed_width;
+  const float full_ht = (float)dev->full.pipe->processed_height;
+  if(pp_wd <= 0 || pp_ht <= 0 || full_wd <= 0 || full_ht <= 0) return;
+
+  // Full-pipe viewport centre in normalised coords
+  float full_pts[2] = { dev->full.zoom_x, dev->full.zoom_y };
+  dt_dev_distort_transform_plus(dev, dev->full.pipe,
+                                0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, full_pts, 1);
+  const float zoom_x_full = full_pts[0] / full_wd - 0.5f;
+  const float zoom_y_full = full_pts[1] / full_ht - 0.5f;
+
+  // Preview-pipe viewport centre in normalised coords
+  const float prev_iw = (float)dev->preview_pipe->iwidth;
+  const float prev_ih = (float)dev->preview_pipe->iheight;
+  float prev_pts[2] = {
+    dev->full.zoom_x * prev_iw / full_iw,
+    dev->full.zoom_y * prev_ih / full_ih
+  };
+  dt_dev_distort_transform_plus(dev, dev->preview_pipe,
+                                0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, prev_pts, 1);
+  const float zoom_x_vp = prev_pts[0] / pp_wd - 0.5f;
+  const float zoom_y_vp = prev_pts[1] / pp_ht - 0.5f;
+
+  *cx = zoom_x_vp - zoom_x_full;
+  *cy = zoom_y_vp - zoom_y_full;
+}
+
 static void _get_zoom_pos_bnd(dt_dev_viewport_t *port,
                               const double x,
                               const double y,
@@ -152,11 +198,7 @@ static void _get_zoom_pos_bnd(dt_dev_viewport_t *port,
 
 void init(dt_view_t *self)
 {
-  dt_develop_t *dev = malloc(sizeof(dt_develop_t));
-  self->data = darktable.develop = dev;
-
-  dt_dev_init(dev, TRUE);
-
+  self->data = darktable.develop;
   darktable.view_manager->proxy.darkroom.view = self;
 
 #ifdef USE_LUA
@@ -184,17 +226,19 @@ void cleanup(dt_view_t *self)
 
   if(dev->second_wnd)
   {
-    if(gtk_widget_is_visible(dev->second_wnd))
+    GtkWidget *wnd = dev->second_wnd;
+    
+    if(gtk_widget_is_visible(wnd))
     {
       dt_conf_set_bool("second_window/last_visible", TRUE);
-      _darkroom_ui_second_window_write_config(dev->second_wnd);
+      _darkroom_ui_second_window_write_config(wnd);
     }
     else
       dt_conf_set_bool("second_window/last_visible", FALSE);
 
-    gtk_window_close(GTK_WINDOW(dev->second_wnd)); // Use close so that _second_window_delete_callback can clean up
-    dev->second_wnd = NULL;
-    dev->preview2.widget = NULL;
+    _darkroom_ui_second_window_cleanup(dev);
+    gtk_widget_hide(wnd);
+    gtk_widget_destroy(wnd);
   }
   else
   {
@@ -698,6 +742,29 @@ void expose(dt_view_t *self,
   float pzx = FLT_MAX, pzy = 0.0f;
   float zoom_scale = dt_dev_get_zoom_scale(&dev->full, port->zoom, 1 << port->closeup, TRUE);
 
+  // Compute viewport center through the preview pipe. port->zoom_x is in full-pipe input
+  // space; scale to preview-pipe input space before forward-transforming. Mask overlay
+  // points live in preview-pipe output space, so the Cairo viewport must use the same
+  // coordinate origin — using the full-pipe result causes a sub-pixel divergence that
+  // becomes a visible shift at high zoom when crop changes the pipe aspect ratio.
+  const float full_iw = dev->full.pipe ? (float)dev->full.pipe->iwidth  : 1.f;
+  const float full_ih = dev->full.pipe ? (float)dev->full.pipe->iheight : 1.f;
+  const float prev_iw = dev->preview_pipe ? (float)dev->preview_pipe->iwidth  : 1.f;
+  const float prev_ih = dev->preview_pipe ? (float)dev->preview_pipe->iheight : 1.f;
+  float prev_pts[2] = {
+    port->zoom_x * prev_iw / full_iw,
+    port->zoom_y * prev_ih / full_ih
+  };
+  dt_dev_distort_transform_plus(dev, dev->preview_pipe,
+                                0.0f, DT_DEV_TRANSFORM_DIR_ALL_GEOMETRY, prev_pts, 1);
+  const float pp_wd = dev->preview_pipe->processed_width;
+  const float pp_ht = dev->preview_pipe->processed_height;
+  float zoom_x_vp = pp_wd > 0 ? prev_pts[0] / pp_wd - 0.5f : 0.f;
+  float zoom_y_vp = pp_ht > 0 ? prev_pts[1] / pp_ht - 0.5f : 0.f;
+  // apply same clamping as zoom_x/zoom_y (image fits nearly entirely in view)
+  if(boxw > 0.95f) zoom_x_vp = 0.f;
+  if(boxh > 0.95f) zoom_y_vp = 0.f;
+
   // don't draw guides and color pickers on image margins
   cairo_rectangle(cri, tb, tb, width - 2.0 * tb, height - 2.0 * tb);
 
@@ -754,7 +821,21 @@ void expose(dt_view_t *self,
         "expose masks",
          port->pipe, dev->gui_module, DT_DEVICE_NONE, NULL, NULL, "%dx%d, px=%d py=%d",
          width, height, pointerx, pointery);
+    // Clip to viewport (excluding border) so mask overlays don't
+    // bleed into the grey border when the image is zoomed in.
+    cairo_save(cri);
+    const float vp_w = (width - 2.0f * tb) / zoom_scale;
+    const float vp_h = (height - 2.0f * tb) / zoom_scale;
+    const float vp_x = (tb - 0.5f * width) / zoom_scale + 0.5f * wd + zoom_x * wd;
+    const float vp_y = (tb - 0.5f * height) / zoom_scale + 0.5f * ht + zoom_y * ht;
+    cairo_rectangle(cri, vp_x, vp_y, vp_w, vp_h);
+    cairo_clip(cri);
+    // Mask overlay points are in preview-pipe output space; shift the
+    // coordinate origin by the sub-pixel difference between full-pipe
+    // and preview-pipe viewport centres so overlays land on the image.
+    cairo_translate(cri, (zoom_x - zoom_x_vp) * wd, (zoom_y - zoom_y_vp) * ht);
     dt_masks_events_post_expose(dmod, cri, width, height, 0.0f, 0.0f, zoom_scale);
+    cairo_restore(cri);
   }
 
   // if dragging the rotation line, do it and nothing else
@@ -1329,7 +1410,8 @@ static void _view_darkroom_filmstrip_activate_callback(gpointer instance,
 
     _dev_change_image(dev, imgid);
     // move filmstrip
-    dt_thumbtable_set_offset_image(dt_ui_thumbtable(darktable.gui->ui), imgid, TRUE);
+    if(dt_conf_get_bool("filmstrip/ui/auto_scroll"))
+      dt_thumbtable_set_offset_image(dt_ui_thumbtable(darktable.gui->ui), imgid, TRUE);
     // force redraw
     dt_control_queue_redraw();
   }
@@ -1365,32 +1447,38 @@ static void _dev_jump_image(dt_develop_t *dev, int diff, gboolean by_key)
   }
   else if(diff > 0)
   {
-    // if we are here, that means that the current is not anymore in
-    // the list in this case, let's use the current offset image
-    new_id = dt_ui_thumbtable(darktable.gui->ui)->offset_imgid;
-    new_offset = dt_ui_thumbtable(darktable.gui->ui)->offset;
+    // past the last image in the collection - wrap around to the first
+    sqlite3_stmt *stmt2;
+    DT_DEBUG_SQLITE3_PREPARE_V2(
+      dt_database_get(darktable.db),
+      "SELECT rowid, imgid FROM memory.collected_images ORDER BY rowid ASC LIMIT 1",
+      -1,
+      &stmt2,
+      NULL);
+    if(sqlite3_step(stmt2) == SQLITE_ROW)
+    {
+      new_offset = sqlite3_column_int(stmt2, 0);
+      new_id = sqlite3_column_int(stmt2, 1);
+      dt_toast_log(_("past end of collection, looped to first image"));
+    }
+    sqlite3_finalize(stmt2);
   }
   else
   {
-    // if we are here, that means that the current is not anymore in
-    // the list in this case, let's use the image before current
-    // offset
-    new_offset = MAX(1, dt_ui_thumbtable(darktable.gui->ui)->offset - 1);
+    // past the first image in the collection - wrap around to the last
     sqlite3_stmt *stmt2;
-    gchar *query2 =
-      g_strdup_printf("SELECT imgid FROM memory.collected_images WHERE rowid=%d",
-                      new_offset);
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query2, -1, &stmt2, NULL);
+    DT_DEBUG_SQLITE3_PREPARE_V2(
+      dt_database_get(darktable.db),
+      "SELECT rowid, imgid FROM memory.collected_images ORDER BY rowid DESC LIMIT 1",
+      -1,
+      &stmt2,
+      NULL);
     if(sqlite3_step(stmt2) == SQLITE_ROW)
     {
-      new_id = sqlite3_column_int(stmt2, 0);
+      new_offset = sqlite3_column_int(stmt2, 0);
+      new_id = sqlite3_column_int(stmt2, 1);
+      dt_toast_log(_("past beginning of collection, looped to last image"));
     }
-    else
-    {
-      new_id = dt_ui_thumbtable(darktable.gui->ui)->offset_imgid;
-      new_offset = dt_ui_thumbtable(darktable.gui->ui)->offset;
-    }
-    g_free(query2);
     sqlite3_finalize(stmt2);
   }
   g_free(query);
@@ -1400,7 +1488,10 @@ static void _dev_jump_image(dt_develop_t *dev, int diff, gboolean by_key)
 
   // if id seems valid, we change the image and move filmstrip
   _dev_change_image(dev, new_id);
-  dt_thumbtable_set_offset(dt_ui_thumbtable(darktable.gui->ui), new_offset, TRUE);
+  if(dt_conf_get_bool("filmstrip/ui/auto_scroll"))
+    dt_thumbtable_set_offset(dt_ui_thumbtable(darktable.gui->ui), new_offset, TRUE);
+  else
+    dt_thumbtable_ensure_imgid_visibility(dt_ui_thumbtable(darktable.gui->ui), new_id);
 
   // if it's a change by key_press, we set mouse_over to the active image
   if(by_key) dt_control_set_mouse_over_id(new_id);
@@ -1431,6 +1522,18 @@ static void zoom_out_callback(dt_action_t *action)
 static void skip_f_key_accel_callback(dt_action_t *action)
 {
   _dev_jump_image(dt_action_view(action)->data, 1, TRUE);
+}
+
+// Toggles the pinned state in the 2nd window.  Has no effect if the 2nd
+// window is not open.
+static void _toggle_pin_second_window_action(dt_action_t *action)
+{
+  dt_view_t *self = dt_action_view(action);
+  dt_develop_t *dev = self->data;
+
+  if(!dev->second_wnd) return;
+
+  dt_dev_toggle_preview2_pinned(dev);
 }
 
 static void skip_b_key_accel_callback(dt_action_t *action)
@@ -1504,13 +1607,28 @@ static void _second_window_quickbutton_clicked(GtkWidget *w,
 {
   if(dev->second_wnd && !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)))
   {
-    _darkroom_ui_second_window_write_config(dev->second_wnd);
+    GtkWidget *wnd = dev->second_wnd;
 
-    gtk_window_close(GTK_WINDOW(dev->second_wnd)); // Use close so that _second_window_delete_callback can clean up
-    dev->second_wnd = NULL;
-    dev->preview2.widget = NULL;
+    // Disable the button for the duration of close+destroy to fix possible
+    // race condition when re-opening the 2nd window while the cleanup code
+    // is still running.
+    gtk_widget_set_sensitive(w, FALSE);
+
+    _darkroom_ui_second_window_write_config(wnd);
+    dt_conf_set_bool("second_window/last_visible", FALSE);
+    _darkroom_ui_second_window_cleanup(dev);
+    gtk_widget_hide(wnd);
+
+    // Flush pending events to let macOS process the hide before destroy
+    while(gtk_events_pending())
+      gtk_main_iteration_do(FALSE);
+
+    gtk_widget_destroy(wnd);
+
+    // Re-enable the button when cleanup is done.
+    gtk_widget_set_sensitive(w, TRUE);
   }
-  else if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)))
+  else if(dev->second_wnd == NULL && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(w)))
     _darkroom_display_second_window(dev);
 }
 
@@ -2443,9 +2561,265 @@ void connect_button_press_release(GtkWidget *w, GtkWidget *p)
                    G_CALLBACK(_quickbutton_press_release), p);
 }
 
+// cycle modules begins
+
+static void _cycle_modules(const gboolean down)
+{
+  GList *modules = NULL;
+  for(GList *l = darktable.develop->iop; l; l = l->next)
+  {
+    dt_iop_module_t *m = l->data;
+    if(m->expander && gtk_widget_is_visible(m->expander))
+    {
+      modules = g_list_prepend(modules, m);
+    }
+  }
+
+  GList *current_item = g_list_find(modules, dt_dev_gui_module());
+  GList *next_item = NULL;
+  if(!modules)
+  {
+    dt_toast_log(_("no visible modules"));
+    return;
+  }
+  else if(!modules->next)
+  {
+    next_item = modules;
+  }
+  else
+  {
+    if(!current_item)
+      current_item = g_list_first(modules);
+    if(down)
+    {
+      next_item = g_list_next(current_item);
+      if(!next_item)
+        next_item = g_list_first(modules);
+    }
+    else
+    {
+      next_item = g_list_previous(current_item);
+      if(!next_item)
+        next_item = g_list_last(modules);
+    }
+  }
+
+  dt_iop_module_t *module_to_focus = (dt_iop_module_t *)next_item->data;
+  dt_iop_gui_set_expanded(module_to_focus, TRUE, dt_conf_get_bool("darkroom/ui/single_module"));
+  const gchar *instance_name = dt_iop_get_instance_name(module_to_focus);
+  const gchar *module_name = dt_iop_get_localized_name(module_to_focus->op);
+  if(strlen(instance_name) > 0)
+    dt_toast_log(_("focused instance '%s' of '%s'"), instance_name, module_name);
+  else
+    dt_toast_log(_("focused module '%s'"), module_name);
+  g_list_free(modules);
+}
+
+static void _enable_focused_module(void)
+{
+  dt_iop_module_t *module = dt_dev_gui_module();
+  if(!module)
+    dt_toast_log(_("no focused module"));
+  else if(module->hide_enable_button)
+    dt_toast_log(_("'%s' cannot be enabled or disabled"), dt_iop_get_localized_name(module->op));
+  else if(module->off)
+  {
+    const gboolean active = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(module->off));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(module->off), !active);
+    const gchar *instance_name = dt_iop_get_instance_name(module);
+    const gchar *module_name = dt_iop_get_localized_name(module->op);
+    if(strlen(instance_name) > 0)
+    {
+      if(!active)
+        dt_toast_log(_("enabled instance '%s' of '%s'"), instance_name, module_name);
+      else
+        dt_toast_log(_("disabled instance '%s' of '%s'"), instance_name, module_name);
+    }
+    else
+    {
+      if(!active)
+        dt_toast_log(_("enabled module '%s'"), module_name);
+      else
+        dt_toast_log(_("disabled module '%s'"), module_name);
+    }
+  }
+}
+
+static void _show_focused_module(void)
+{
+  dt_iop_module_t *module = dt_dev_gui_module();
+  if(!module)
+    dt_toast_log(_("no focused module"));
+  else
+    dt_iop_gui_set_expanded(module, TRUE, dt_conf_get_bool("darkroom/ui/single_module"));
+}
+
+static void _new_instance_focused_module(void)
+{
+  dt_iop_module_t *module = dt_dev_gui_module();
+  if(!module)
+    dt_toast_log(_("no focused module"));
+  else if(module->flags() & IOP_FLAGS_ONE_INSTANCE)
+    dt_toast_log(_("'%s' does not support multiple instances"),
+                 dt_iop_get_localized_name(module->op));
+  else
+  {
+    dt_iop_module_t *new_module = dt_iop_gui_duplicate(module, FALSE);
+    if(new_module)
+    {
+      const gchar *instance_name = dt_iop_get_instance_name(new_module);
+      if(strlen(instance_name) > 0)
+        dt_toast_log(_("added instance '%s' of '%s'"),
+                     instance_name,
+                     dt_iop_get_localized_name(new_module->op));
+      else
+        dt_toast_log(_("added instance of '%s'"), dt_iop_get_localized_name(new_module->op));
+    }
+  }
+}
+
+static void _delete_focused_module_instance(void)
+{
+  dt_iop_module_t *module = dt_dev_gui_module();
+  if(!module)
+    dt_toast_log(_("no focused module"));
+  else if(module->flags() & IOP_FLAGS_ONE_INSTANCE)
+    dt_toast_log(_("'%s' does not support multiple instances"),
+                 dt_iop_get_localized_name(module->op));
+  else
+  {
+    const gchar *localized = dt_iop_get_localized_name(module->op);
+    gchar *instance_name = g_strdup(dt_iop_get_instance_name(module));
+    dt_iop_gui_delete(module);
+    if(strlen(instance_name) > 0)
+      dt_toast_log(_("deleted instance '%s' of '%s'"), instance_name, localized);
+    else
+      dt_toast_log(_("deleted instance of '%s'"), localized);
+    g_free(instance_name);
+  }
+}
+
+static void _action_enable_focused(dt_action_t *action)
+{
+  _enable_focused_module();
+}
+
+static void _action_show_focused(dt_action_t *action)
+{
+  _show_focused_module();
+}
+
+static void _action_new_instance_focused(dt_action_t *action)
+{
+  _new_instance_focused_module();
+}
+
+static void _action_delete_instance_focused(dt_action_t *action)
+{
+  _delete_focused_module_instance();
+}
+
+static void _cycle_instances(const gboolean down)
+{
+  dt_iop_module_t *current_module = dt_dev_gui_module();
+  if(!current_module)
+  {
+    dt_toast_log(_("no focused module"));
+    return;
+  }
+
+  GList *instances = NULL;
+  for(GList *l = darktable.develop->iop; l; l = l->next)
+  {
+    dt_iop_module_t *m = l->data;
+    if(!strcmp(m->op, current_module->op) && m->expander && gtk_widget_is_visible(m->expander))
+    {
+      instances = g_list_prepend(instances, m);
+    }
+  }
+
+  if(!instances || !instances->next)
+  {
+    g_list_free(instances);
+    dt_toast_log(_("only one instance of '%s'"), dt_iop_get_localized_name(current_module->op));
+    return;
+  }
+
+  GList *current_item = g_list_find(instances, current_module);
+  GList *next_item = NULL;
+  if(down)
+  {
+    next_item = g_list_next(current_item);
+    if(!next_item)
+      next_item = g_list_first(instances);
+  }
+  else
+  {
+    next_item = g_list_previous(current_item);
+    if(!next_item)
+      next_item = g_list_last(instances);
+  }
+
+  dt_iop_module_t *module_to_focus = (dt_iop_module_t *)next_item->data;
+  dt_iop_gui_set_expanded(module_to_focus, TRUE, dt_conf_get_bool("darkroom/ui/single_module"));
+  const gchar *instance_name = dt_iop_get_instance_name(module_to_focus);
+  if(strlen(instance_name) > 0)
+    dt_toast_log(_("focused instance '%s' of '%s'"),
+                 instance_name,
+                 dt_iop_get_localized_name(module_to_focus->op));
+  else
+    dt_toast_log(_("focused module '%s'"), dt_iop_get_localized_name(module_to_focus->op));
+  g_list_free(instances);
+}
+
+static float _action_callback_cycle_modules(gpointer widget,
+                                            dt_action_element_t element,
+                                            const dt_action_effect_t effect,
+                                            const float move_size)
+{
+  if(DT_PERFORM_ACTION(move_size))
+  {
+    switch(effect)
+    {
+    case DT_ACTION_EFFECT_DEFAULT_KEY:
+      _enable_focused_module();
+      break;
+    case DT_ACTION_EFFECT_DEFAULT_UP:
+      _cycle_modules(FALSE);
+      break;
+    case DT_ACTION_EFFECT_DEFAULT_DOWN:
+      _cycle_modules(TRUE);
+      break;
+    case DT_ACTION_EFFECT_CYCLE_PREVIOUS_INSTANCE:
+      _cycle_instances(FALSE);
+      break;
+    case DT_ACTION_EFFECT_CYCLE_NEXT_INSTANCE:
+      _cycle_instances(TRUE);
+      break;
+    }
+    return 0;
+  }
+  return DT_ACTION_NOT_VALID;
+}
+
+static const dt_action_element_def_t _action_elements_cycle_modules[]
+  = { { NULL, dt_action_effect_cycle } };
+
+static const dt_action_def_t _action_def_cycle_modules
+  = { N_("cycle modules"),
+      _action_callback_cycle_modules,
+      _action_elements_cycle_modules,
+      NULL, TRUE };
+
+// cycle modules ends
+
 void gui_init(dt_view_t *self)
 {
   dt_develop_t *dev = self->data;
+  dev->full.ppd = darktable.gui->ppd;
+  dev->full.dpi = darktable.gui->dpi;
+  dev->full.dpi_factor = darktable.gui->dpi_factor;
+  dev->full.widget = dt_ui_center(darktable.gui->ui);
 
   dt_action_t *sa = &self->actions, *ac = NULL;
 
@@ -2485,6 +2859,27 @@ void gui_init(dt_view_t *self)
                               _("display a second darkroom image window"));
   dt_view_manager_view_toolbox_add(darktable.view_manager,
                                    dev->second_wnd_button, DT_VIEW_DARKROOM);
+
+  /* Register a toggle-pin action for the second window as a command so the
+     shortcut works independently of the pin button widget.  The pin button
+     is wired to this same action in _darkroom_ui_second_window_init() for
+     right-click shortcut assignment and tooltip display. */
+  dt_action_register(DT_ACTION(self), N_("toggle pinned state in second window"),
+                     _toggle_pin_second_window_action, 0, 0);
+
+  /* cycle through visible modules and their instances */
+  dt_action_define(sa, NULL, N_("cycle modules"), NULL, &_action_def_cycle_modules);
+
+  /* global <focused> shortcuts */
+  dt_action_register(&darktable.control->actions_focus, N_("enable"), _action_enable_focused, 0, 0);
+  dt_action_register(&darktable.control->actions_focus, N_("show"), _action_show_focused, 0, 0);
+  dt_action_register(
+    &darktable.control->actions_focus, N_("new instance"), _action_new_instance_focused, 0, 0);
+  dt_action_register(&darktable.control->actions_focus,
+                     N_("delete instance"),
+                     _action_delete_instance_focused,
+                     0,
+                     0);
 
   /* Enable color assessment conditions */
   {
@@ -3014,6 +3409,15 @@ void enter(dt_view_t *self)
 
   dt_print(DT_DEBUG_CONTROL, "[run_job+] 11 %f in darkroom mode", dt_get_wtime());
   dt_develop_t *dev = self->data;
+  
+  // Reset shutdown flags on all pipes - they may still be set from previous session
+  if(dev->full.pipe)
+    dt_atomic_set_int(&dev->full.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
+  if(dev->preview_pipe)
+    dt_atomic_set_int(&dev->preview_pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
+  if(dev->preview2.pipe)
+    dt_atomic_set_int(&dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
+  
   if(!dev->form_gui)
   {
     dev->form_gui = (dt_masks_form_gui_t *)calloc(1, sizeof(dt_masks_form_gui_t));
@@ -3157,6 +3561,23 @@ void leave(dt_view_t *self)
     dt_conf_set_string("plugins/darkroom/active", "");
 
   dt_develop_t *dev = self->data;
+
+  // Close second window when leaving darkroom (save state first)
+  if(dev->second_wnd)
+  {
+    GtkWidget *wnd = dev->second_wnd;
+    
+    if(gtk_widget_is_visible(wnd))
+    {
+      dt_conf_set_bool("second_window/last_visible", TRUE);
+      _darkroom_ui_second_window_write_config(wnd);
+    }
+    
+    _darkroom_ui_second_window_cleanup(dev);
+    gtk_widget_hide(wnd);
+    gtk_widget_destroy(wnd);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->second_wnd_button), FALSE);
+  }
 
   // reset color assessment mode
   if(dev->full.color_assessment)
@@ -3312,7 +3733,7 @@ void mouse_leave(dt_view_t *self)
     handled = dev->gui_module->mouse_leave(dev->gui_module);
 
   // reset any changes the selected plugin might have made.
-  dt_control_change_cursor(GDK_LEFT_PTR);
+  dt_control_change_cursor("default");
 }
 
 void mouse_enter(dt_view_t *self)
@@ -3360,7 +3781,7 @@ void mouse_moved(dt_view_t *self,
 
     if(sample->size == DT_LIB_COLORPICKER_SIZE_BOX)
     {
-      float corner[2];
+      dt_pickerpoint_t corner;
       dt_color_picker_transform_box(dev, 1, sample->point, corner, TRUE);
 
       pbox[0] = MAX(0.0, MIN(corner[0], zoom_x) - delta_x);
@@ -3385,7 +3806,9 @@ void mouse_moved(dt_view_t *self,
      && !dt_iop_color_picker_is_visible(dev))
   {
     _get_zoom_pos(&dev->full, x, y, &zoom_x, &zoom_y, &zoom_scale);
-    handled = dt_masks_events_mouse_moved(dev->gui_module, zoom_x, zoom_y,
+    float corr_x, corr_y;
+    _preview_pipe_zoom_correction(dev, &corr_x, &corr_y);
+    handled = dt_masks_events_mouse_moved(dev->gui_module, zoom_x + corr_x, zoom_y + corr_y,
                                           pressure, which, zoom_scale);
   }
 
@@ -3409,8 +3832,8 @@ void mouse_moved(dt_view_t *self,
     else
     {
       const int32_t bs = dev->full.border_size;
-      float dx = MIN(0, x - bs) + MAX(0, x - dev->full.width  - bs);
-      float dy = MIN(0, y - bs) + MAX(0, y - dev->full.height - bs);
+      const float dx = MIN(0, x - bs) + MAX(0, x - dev->full.width  - bs);
+      const float dy = MIN(0, y - bs) + MAX(0, y - dev->full.height - bs);
       if(fabsf(dx) + fabsf(dy) > 0.5f)
         dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, 1.f, 0, dx, dy, TRUE);
     }
@@ -3439,7 +3862,7 @@ int button_released(dt_view_t *self,
 
   if(darktable.develop->darkroom_skip_mouse_events && which == GDK_BUTTON_PRIMARY)
   {
-    dt_control_change_cursor(GDK_LEFT_PTR);
+    dt_control_change_cursor("default");
     return 1;
   }
 
@@ -3451,7 +3874,7 @@ int button_released(dt_view_t *self,
     {
       dev->preview_pipe->status = DT_DEV_PIXELPIPE_DIRTY;
       dt_control_queue_redraw_center();
-      dt_control_change_cursor(GDK_LEFT_PTR);
+      dt_control_change_cursor("default");
     }
     return 1;
   }
@@ -3469,7 +3892,9 @@ int button_released(dt_view_t *self,
   if(dev->form_visible)
   {
     _get_zoom_pos(&dev->full, x, y, &zoom_x, &zoom_y, &zoom_scale);
-    handled = dt_masks_events_button_released(dev->gui_module, zoom_x, zoom_y,
+    float corr_x, corr_y;
+    _preview_pipe_zoom_correction(dev, &corr_x, &corr_y);
+    handled = dt_masks_events_button_released(dev->gui_module, zoom_x + corr_x, zoom_y + corr_y,
                                               which, state, zoom_scale);
     if(handled) return handled;
   }
@@ -3482,7 +3907,7 @@ int button_released(dt_view_t *self,
                                                which, state, zoom_scale);
     if(handled) return handled;
   }
-  if(which == GDK_BUTTON_PRIMARY) dt_control_change_cursor(GDK_LEFT_PTR);
+  if(which == GDK_BUTTON_PRIMARY) dt_control_change_cursor("default");
 
   return 1;
 }
@@ -3506,7 +3931,7 @@ int button_pressed(dt_view_t *self,
     if(which == GDK_BUTTON_PRIMARY)
     {
       if(type == GDK_2BUTTON_PRESS) return 0;
-      dt_control_change_cursor(GDK_HAND1);
+      dt_control_change_cursor("pointer");
       return 1;
     }
     else if(which == GDK_BUTTON_SECONDARY && dev->proxy.rotate)
@@ -3522,6 +3947,26 @@ int button_pressed(dt_view_t *self,
   {
     const int procw = dev->preview_pipe->backbuf_width;
     const int proch = dev->preview_pipe->backbuf_height;
+
+    // For a Ctrl+Click we do change the color picker from/to area <-> point
+    if(which == GDK_BUTTON_PRIMARY
+       && dt_modifier_is(state, GDK_CONTROL_MASK))
+    {
+      if(sample->size == DT_LIB_COLORPICKER_SIZE_POINT)
+      {
+        // dt_lib_colorpicker_reset_box_area(sample->box);
+        dt_lib_colorpicker_set_box_area(darktable.lib, sample->box);
+      }
+      else if(sample->size == DT_LIB_COLORPICKER_SIZE_BOX)
+      {
+        dt_lib_colorpicker_set_point(darktable.lib, sample->point);
+      }
+
+      dev->preview_pipe->status = DT_DEV_PIXELPIPE_DIRTY;
+      dt_control_queue_redraw_center();
+
+      return 1;
+    }
 
     if(which == GDK_BUTTON_PRIMARY)
     {
@@ -3558,7 +4003,7 @@ int button_pressed(dt_view_t *self,
                                           zoom_y + dy };
           dt_color_picker_backtransform_box(dev, 2, fbox, sample->box);
         }
-        dt_control_change_cursor(GDK_FLEUR);
+        dt_control_change_cursor("move");
       }
 
       dt_color_picker_backtransform_box(dev, 1, sample->point, sample->point);
@@ -3611,11 +4056,8 @@ int button_pressed(dt_view_t *self,
       }
       if(sample->size == DT_LIB_COLORPICKER_SIZE_BOX)
       {
-        // default is hardcoded this way
-        // FIXME: color_pixer_proxy should have an dt_iop_color_picker_clear_area() function for this
-        dt_boundingbox_t reset = { 0.02f, 0.02f, 0.98f, 0.98f };
         dt_pickerbox_t box;
-        dt_color_picker_backtransform_box(dev, 2, reset, box);
+        dt_lib_colorpicker_reset_box_area(box);
         dt_lib_colorpicker_set_box_area(darktable.lib, box);
         dev->preview_pipe->status = DT_DEV_PIXELPIPE_DIRTY;
         dt_control_queue_redraw_center();
@@ -3629,7 +4071,9 @@ int button_pressed(dt_view_t *self,
   if(dev->form_visible)
   {
     _get_zoom_pos(&dev->full, x, y, &zoom_x, &zoom_y, &zoom_scale);
-    handled = dt_masks_events_button_pressed(dev->gui_module, zoom_x, zoom_y,
+    float corr_x, corr_y;
+    _preview_pipe_zoom_correction(dev, &corr_x, &corr_y);
+    handled = dt_masks_events_button_pressed(dev->gui_module, zoom_x + corr_x, zoom_y + corr_y,
                                              pressure, which, type, state);
     if(handled) return handled;
   }
@@ -3646,7 +4090,7 @@ int button_pressed(dt_view_t *self,
   if(which == GDK_BUTTON_PRIMARY && type == GDK_2BUTTON_PRESS) return 0;
   if(which == GDK_BUTTON_PRIMARY)
   {
-    dt_control_change_cursor(GDK_HAND1);
+    dt_control_change_cursor("pointer");
     return 1;
   }
 
@@ -3685,7 +4129,10 @@ void scrolled(dt_view_t *self,
      && !darktable.develop->darkroom_skip_mouse_events)
   {
     _get_zoom_pos(&dev->full, x, y, &zoom_x, &zoom_y, &zoom_scale);
-    handled = dt_masks_events_mouse_scrolled(dev->gui_module, zoom_x, zoom_y, up, state);
+    float corr_x, corr_y;
+    _preview_pipe_zoom_correction(dev, &corr_x, &corr_y);
+    handled = dt_masks_events_mouse_scrolled(dev->gui_module, zoom_x + corr_x, zoom_y + corr_y,
+                                             up, state);
     if(handled) return;
   }
 
@@ -3703,6 +4150,82 @@ void scrolled(dt_view_t *self,
   // free zoom
   const gboolean constrained = !dt_modifier_is(state, GDK_CONTROL_MASK);
   dt_dev_zoom_move(&dev->full, DT_ZOOM_SCROLL, 0.0f, up, x, y, constrained);
+}
+
+gboolean gesture_pan(dt_view_t *self,
+                     const double x,
+                     const double y,
+                     const double dx,
+                     const double dy,
+                     const int state)
+{
+  dt_develop_t *dev = self->data;
+  (void)x;
+  (void)y;
+  (void)state;
+  if(!dev) return FALSE;
+
+  // Mask editing (brush etc.) uses scroll for tool parameters.
+  if(dev->form_visible
+     && !darktable.develop->darkroom_skip_mouse_events)
+    return FALSE;
+
+  // Let active modules consume scroll for their own interactions (e.g. brush size).
+  if(dev->gui_module && dev->gui_module->scrolled
+     && !darktable.develop->darkroom_skip_mouse_events
+     && !dt_iop_color_picker_is_visible(dev)
+     && dt_dev_modulegroups_test_activated(darktable.develop))
+    return FALSE;
+
+  if(dx == 0.0 && dy == 0.0) return FALSE;
+
+  dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, 1.0f, 0, dx, dy, TRUE);
+  return TRUE;
+}
+
+gboolean gesture_pinch(dt_view_t *self,
+                       const double x,
+                       const double y,
+                       const int phase,
+                       const double scale,
+                       const int state)
+{
+  dt_develop_t *dev = self->data;
+  if(!dev) return FALSE;
+  const gboolean constrained = !dt_modifier_is(state, GDK_CONTROL_MASK);
+  const double pinch_step_ratio = 1.1;
+
+  static double pinch_last_scale = 0.0;
+
+  if(phase == GDK_TOUCHPAD_GESTURE_PHASE_BEGIN)
+  {
+    pinch_last_scale = scale > 0.0 ? scale : 1.0;
+    return TRUE;
+  }
+  else if(phase == GDK_TOUCHPAD_GESTURE_PHASE_END
+          || phase == GDK_TOUCHPAD_GESTURE_PHASE_CANCEL)
+  {
+    pinch_last_scale = 0.0;
+    return TRUE;
+  }
+
+  if(phase != GDK_TOUCHPAD_GESTURE_PHASE_UPDATE) return FALSE;
+  if(pinch_last_scale <= 0.0 || scale <= 0.0) return FALSE;
+
+  const double ratio = scale / pinch_last_scale;
+  int zoom_step = -1;
+  if(ratio > pinch_step_ratio)
+    zoom_step = 1;
+  else if(ratio < 1.0 / pinch_step_ratio)
+    zoom_step = 0;
+
+  if(zoom_step >= 0)
+  {
+    dt_dev_zoom_move(&dev->full, DT_ZOOM_SCROLL, 0.0f, zoom_step, x, y, constrained);
+    pinch_last_scale = scale;
+  }
+
+  return TRUE;
 }
 
 static void _change_slider_accel_precision(dt_action_t *action)
@@ -3809,19 +4332,79 @@ static gboolean _second_window_draw_callback(GtkWidget *widget,
                                              cairo_t *cri,
                                              dt_develop_t *dev)
 {
-  cairo_set_source_rgb(cri, 0.2, 0.2, 0.2);
+  // Set background
+  dt_gui_gtk_set_source_rgb(cri, DT_GUI_COLOR_DARKROOM_BG);
+  cairo_paint(cri);
 
-  if(dev->preview2.pipe->backbuf)  // do we have an image?
+  // Early exit if we're in an inconsistent state
+  if(!dev->preview2.widget || dev->gui_leaving)
+    return TRUE;
+
+  // Determine which develop and viewport to use
+  // Take a local copy of the pointer to avoid race conditions
+  dt_develop_t *pinned_dev = dev->preview2_pinned ? dev->preview2_pinned_dev : NULL;
+  dt_develop_t *render_dev = pinned_dev ? pinned_dev : dev;
+  dt_dev_viewport_t *port = &render_dev->preview2;
+  
+  // Check if pinned dev is being cleaned up
+  if(pinned_dev && pinned_dev->gui_leaving)
   {
-    // draw image
-    dt_gui_gtk_set_source_rgb(cri, DT_GUI_COLOR_DARKROOM_BG);
-    cairo_paint(cri);
-
-    _view_paint_surface(cri, dev->preview2.orig_width, dev->preview2.orig_height,
-                        &dev->preview2, DT_WINDOW_SECOND);
+    render_dev = dev;
+    port = &dev->preview2;
+    pinned_dev = NULL;
+  }
+  
+  // For pinned images, sync viewport dimensions from main dev
+  if(pinned_dev)
+  {
+    port->width = dev->preview2.width;
+    port->height = dev->preview2.height;
+    port->orig_width = dev->preview2.orig_width;
+    port->orig_height = dev->preview2.orig_height;
+    port->ppd = dev->preview2.ppd;
+    port->dpi = dev->preview2.dpi;
+    port->dpi_factor = dev->preview2.dpi_factor;
   }
 
-  if(_preview2_request(dev)) dt_dev_process_preview2(dev);
+  if(port->pipe && port->pipe->backbuf)  // do we have a preview image?
+  {
+    // draw the preview image using the appropriate viewport
+    _view_paint_surface(cri, dev->preview2.orig_width, dev->preview2.orig_height,
+                       port, DT_WINDOW_SECOND);
+  }
+  else if(pinned_dev)
+  {
+    // Pinned image is still rendering.
+    // Only use the main dev's backbuf as a fallback when the pinned image is
+    // the same as the one in the main view — this avoids flickering when
+    // pinning the currently-edited image.
+    // For a different image, keep the black background rather than flashing
+    // the wrong image while the new pixelpipe processes.
+    if(pinned_dev->image_storage.id == dev->image_storage.id
+       && dev->preview2.pipe && dev->preview2.pipe->backbuf)
+    {
+      _view_paint_surface(cri, dev->preview2.orig_width, dev->preview2.orig_height,
+                         &dev->preview2, DT_WINDOW_SECOND);
+    }
+  }
+
+  // Request processing if needed
+  if(pinned_dev && !pinned_dev->gui_leaving)
+  {
+    // Process pinned image pipeline - process if no backbuf, pipe dirty, or zoom/pan changed
+    if(!port->pipe->backbuf
+       || port->pipe->status == DT_DEV_PIXELPIPE_DIRTY
+       || port->pipe->status == DT_DEV_PIXELPIPE_INVALID
+       || port->pipe->changed != DT_DEV_PIPE_UNCHANGED)
+    {
+      dt_dev_process_preview2(pinned_dev);
+    }
+  }
+  else if(!pinned_dev)
+  {
+    // Process main dev's preview2 pipeline
+    if(_preview2_request(dev)) dt_dev_process_preview2(dev);
+  }
 
   return TRUE;
 }
@@ -3830,11 +4413,19 @@ static gboolean _second_window_scrolled_callback(GtkWidget *widget,
                                                  GdkEventScroll *event,
                                                  dt_develop_t *dev)
 {
+  if(dev->gui_leaving) return TRUE;
+  
   int delta_y;
   if(dt_gui_get_scroll_unit_delta(event, &delta_y))
   {
+    // Use pinned viewport if pinned, otherwise main dev's preview2
+    dt_develop_t *pinned_dev = dev->preview2_pinned ? dev->preview2_pinned_dev : NULL;
+    if(pinned_dev && pinned_dev->gui_leaving) pinned_dev = NULL;
+    
+    dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
+
     const gboolean constrained = !dt_modifier_is(event->state, GDK_CONTROL_MASK);
-    dt_dev_zoom_move(&dev->preview2, DT_ZOOM_SCROLL, 0.0f, delta_y < 0,
+    dt_dev_zoom_move(port, DT_ZOOM_SCROLL, 0.0f, delta_y < 0,
                      event->x, event->y, constrained);
   }
 
@@ -3845,9 +4436,24 @@ static gboolean _second_window_button_pressed_callback(GtkWidget *w,
                                                        GdkEventButton *event,
                                                        dt_develop_t *dev)
 {
-  if(event->type == GDK_2BUTTON_PRESS) return 0;
+  if(dev->gui_leaving) return FALSE;
+  
+  // Use pinned viewport if pinned, otherwise main dev's preview2
+  dt_develop_t *pinned_dev = dev->preview2_pinned ? dev->preview2_pinned_dev : NULL;
+  if(pinned_dev && pinned_dev->gui_leaving) pinned_dev = NULL;
+  
+  dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
+
+  // Handle double-click to reset zoom and center
+  if(event->type == GDK_2BUTTON_PRESS && event->button == GDK_BUTTON_PRIMARY)
+  {
+    dt_dev_zoom_move(port, DT_ZOOM_FIT, 0.0f, 0,
+                     event->x, event->y, TRUE);
+    return TRUE;
+  }
   if(event->button == GDK_BUTTON_PRIMARY)
   {
+    // store coordinates in logical pixels (as delivered by event)
     darktable.control->button_x = event->x;
     darktable.control->button_y = event->y;
     _dt_second_window_change_cursor(dev, "grabbing");
@@ -3855,7 +4461,7 @@ static gboolean _second_window_button_pressed_callback(GtkWidget *w,
   }
   if(event->button == GDK_BUTTON_MIDDLE)
   {
-    dt_dev_zoom_move(&dev->preview2, DT_ZOOM_1, 0.0f, -2,
+    dt_dev_zoom_move(port, DT_ZOOM_1, 0.0f, -2,
                      event->x, event->y, !dt_modifier_is(event->state, GDK_CONTROL_MASK));
     return TRUE;
   }
@@ -3876,10 +4482,19 @@ static gboolean _second_window_mouse_moved_callback(GtkWidget *w,
                                                     GdkEventMotion *event,
                                                     dt_develop_t *dev)
 {
+  if(dev->gui_leaving) return FALSE;
+  
   if(event->state & GDK_BUTTON1_MASK)
   {
     dt_control_t *ctl = darktable.control;
-    dt_dev_zoom_move(&dev->preview2, DT_ZOOM_MOVE, -1.f, 0,
+    
+    // Use pinned viewport if pinned, otherwise main dev's preview2
+    dt_develop_t *pinned_dev = dev->preview2_pinned ? dev->preview2_pinned_dev : NULL;
+    if(pinned_dev && pinned_dev->gui_leaving) pinned_dev = NULL;
+    
+    dt_dev_viewport_t *port = pinned_dev ? &pinned_dev->preview2 : &dev->preview2;
+
+    dt_dev_zoom_move(port, DT_ZOOM_MOVE, -1.f, 0,
                      event->x - ctl->button_x, event->y - ctl->button_y, TRUE);
     ctl->button_x = event->x;
     ctl->button_y = event->y;
@@ -3900,8 +4515,12 @@ static gboolean _second_window_configure_callback(GtkWidget *da,
                                                   GdkEventConfigure *event,
                                                   dt_develop_t *dev)
 {
-  if(dev->preview2.orig_width != event->width
-     || dev->preview2.orig_height != event->height)
+  if(dev->gui_leaving) return TRUE;
+  
+  gboolean size_changed = (dev->preview2.orig_width != event->width || 
+                          dev->preview2.orig_height != event->height);
+  
+  if(size_changed)
   {
     dev->preview2.width = event->width;
     dev->preview2.height = event->height;
@@ -3912,6 +4531,20 @@ static gboolean _second_window_configure_callback(GtkWidget *da,
     dev->preview2.pipe->status = DT_DEV_PIXELPIPE_DIRTY;
     dev->preview2.pipe->changed |= DT_DEV_PIPE_REMOVE;
     dev->preview2.pipe->cache_obsolete = TRUE;
+    
+    // If we have a pinned image, update its viewport dimensions too
+    dt_develop_t *pinned_dev = dev->preview2_pinned ? dev->preview2_pinned_dev : NULL;
+    if(pinned_dev && !pinned_dev->gui_leaving)
+    {
+      dt_dev_viewport_t *pinned_port = &pinned_dev->preview2;
+      pinned_port->width = event->width;
+      pinned_port->height = event->height;
+      pinned_port->orig_width = event->width;
+      pinned_port->orig_height = event->height;
+      pinned_port->pipe->status = DT_DEV_PIXELPIPE_DIRTY;
+      pinned_port->pipe->changed |= DT_DEV_PIPE_REMOVE;
+      pinned_port->pipe->cache_obsolete = TRUE;
+    }
   }
 
   dt_colorspaces_set_display_profile(DT_COLORSPACE_DISPLAY2);
@@ -3921,35 +4554,135 @@ static gboolean _second_window_configure_callback(GtkWidget *da,
 #endif
 
   dt_dev_configure(&dev->preview2);
+  
+  // Also configure pinned viewport if present
+  dt_develop_t *pinned_dev = dev->preview2_pinned ? dev->preview2_pinned_dev : NULL;
+  if(pinned_dev && !pinned_dev->gui_leaving)
+  {
+    dt_dev_viewport_t *pinned_port = &pinned_dev->preview2;
+    pinned_port->ppd = dev->preview2.ppd;
+    pinned_port->dpi = dev->preview2.dpi;
+    pinned_port->dpi_factor = dev->preview2.dpi_factor;
+    dt_dev_configure(pinned_port);
+  }
 
   return TRUE;
 }
 
-static void _darkroom_ui_second_window_init(GtkWidget *widget,
+static gboolean _second_window_buttons_enter_notify_callback(GtkWidget *widget,
+                                                              GdkEventCrossing *event,
+                                                              GtkWidget *button_box)
+{
+  // Make buttons visible and interactive.  Using opacity instead of hide/show
+  // keeps the GdkWindow (and its NSView tracking areas on macOS) always alive,
+  // which is required for GTK's tooltip mechanism to work correctly.
+  gtk_widget_set_opacity(button_box, 1.0);
+  gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(gtk_widget_get_parent(button_box)),
+                                       button_box, FALSE);
+  return FALSE;
+}
+
+static gboolean _second_window_buttons_leave_notify_callback(GtkWidget *widget,
+                                                              GdkEventCrossing *event,
+                                                              GtkWidget *button_box)
+{
+  // GDK_NOTIFY_INFERIOR means the pointer moved into a child window (still
+  // within the second window); keep the buttons visible in that case.
+  if(event->detail != GDK_NOTIFY_INFERIOR)
+  {
+    gtk_widget_set_opacity(button_box, 0.0);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(gtk_widget_get_parent(button_box)),
+                                         button_box, TRUE);
+  }
+  return FALSE;
+}
+
+// Callback for the pin button in the overlay
+static void _preview2_pin_button_clicked(GtkToggleButton *button,
+                                         dt_develop_t *dev)
+{
+  dt_dev_toggle_preview2_pinned(dev);
+}
+
+
+static void _darkroom_ui_second_window_init(GtkWidget *overlay,
                                             dt_develop_t *dev)
 {
+  // Get the window that contains this overlay
+  GtkWidget *window = gtk_widget_get_toplevel(overlay);
+  
   const int width = MAX(10, dt_conf_get_int("second_window/window_w"));
   const int height = MAX(10, dt_conf_get_int("second_window/window_h"));
-
-  dev->preview2.border_size = 0;
-
   const gint x = MAX(0, dt_conf_get_int("second_window/window_x"));
   const gint y = MAX(0, dt_conf_get_int("second_window/window_y"));
-  gtk_window_set_default_size(GTK_WINDOW(widget), width, height);
-  gtk_widget_show_all(widget);
-  gtk_window_move(GTK_WINDOW(widget), x, y);
-  gtk_window_resize(GTK_WINDOW(widget), width, height);
+  
+  // Group buttons in a vertical box for easy future expansion.
+  GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+
+  // Create the pin button
+  GtkWidget *pin_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_pin, 0, NULL);
+  gtk_widget_set_name(pin_button, "dt_window2_pin_button");
+  gtk_widget_set_size_request(pin_button, 24, 24);
+  gtk_widget_set_tooltip_text(pin_button, _("pin current image"));
+  g_signal_connect(G_OBJECT(pin_button), "toggled",
+                   G_CALLBACK(_preview2_pin_button_clicked), dev);
+  gtk_box_pack_start(GTK_BOX(button_box), pin_button, FALSE, FALSE, 0);
+
+  // Associate the pin button with the toggle COMMAND action registered in
+  // gui_init().  Passing action_def=NULL leaves the action type and callback
+  // unchanged, but sets the action quark on the widget so right-click
+  // shortcut assignment and shortcut tooltips work on the pin button itself.
+  dt_action_define(DT_ACTION(darktable.view_manager->current_view), NULL,
+                   N_("toggle pinned state in second window"), pin_button, NULL);
+
+  // Wrap the box in a GtkEventBox so that the overlay can toggle pass-through on
+  // a windowed widget, which enables tooltip rendering.
+  GtkWidget *event_box = gtk_event_box_new();
+  gtk_widget_set_halign(event_box, GTK_ALIGN_END);
+  gtk_widget_set_valign(event_box, GTK_ALIGN_START);
+  gtk_widget_set_margin_top(event_box, 10);
+  gtk_widget_set_margin_end(event_box, 10);
+  gtk_container_add(GTK_CONTAINER(event_box), button_box);
+
+  // Add the event box as a single overlay widget.  Start transparent and
+  // non-interactive; the enter/leave callbacks will toggle opacity and
+  // pass-through.  Keeping the widget always mapped (never hidden) preserves
+  // NSView tracking areas on macOS, which is required for GTK's tooltip
+  // mechanism to work.
+  gtk_overlay_add_overlay(GTK_OVERLAY(overlay), event_box);
+  gtk_widget_show_all(event_box);
+  gtk_widget_set_opacity(event_box, 0.0);
+  gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), event_box, TRUE);
+
+  // Needed to display/hide the widgets.
+  // Must be done before the window is realized.
+  gtk_widget_add_events(window, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+
+  // Show / hide controls on enter/leave events.
+  g_signal_connect(G_OBJECT(window), "enter-notify-event",
+                   G_CALLBACK(_second_window_buttons_enter_notify_callback), event_box);
+  g_signal_connect(G_OBJECT(window), "leave-notify-event",
+                   G_CALLBACK(_second_window_buttons_leave_notify_callback), event_box);
+
+  dev->preview2.pin_button = pin_button;
+  
+  dev->preview2.border_size = 0;
+  gtk_window_set_default_size(GTK_WINDOW(window), width, height);
+  gtk_window_move(GTK_WINDOW(window), x, y);
+  gtk_window_resize(GTK_WINDOW(window), width, height);
+  
+  // Handle window state (fullscreen/maximized)
   const int fullscreen = dt_conf_get_bool("second_window/fullscreen");
-  if(fullscreen)
-    gtk_window_fullscreen(GTK_WINDOW(widget));
+  if (fullscreen)
+    gtk_window_fullscreen(GTK_WINDOW(window));
   else
   {
-    gtk_window_unfullscreen(GTK_WINDOW(widget));
+    gtk_window_unfullscreen(GTK_WINDOW(window));
     const int maximized = dt_conf_get_bool("second_window/maximized");
-    if(maximized)
-      gtk_window_maximize(GTK_WINDOW(widget));
+    if (maximized)
+      gtk_window_maximize(GTK_WINDOW(window));
     else
-      gtk_window_unmaximize(GTK_WINDOW(widget));
+      gtk_window_unmaximize(GTK_WINDOW(window));
   }
 }
 
@@ -3969,28 +4702,112 @@ static void _darkroom_ui_second_window_write_config(GtkWidget *widget)
                    (gdk_window_get_state(gtk_widget_get_window(widget)) & GDK_WINDOW_STATE_FULLSCREEN));
 }
 
+// Helper to clean up second window state - called before destroying window
+static void _darkroom_ui_second_window_cleanup(dt_develop_t *dev)
+{
+  // Signal main preview2 pipe to stop and wait for any pending jobs
+  if(dev->preview2.pipe)
+  {
+    dt_atomic_set_int(&dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
+    dt_pthread_mutex_lock(&dev->preview2.pipe->mutex);
+    dt_pthread_mutex_unlock(&dev->preview2.pipe->mutex);
+    dt_pthread_mutex_lock(&dev->preview2.pipe->busy_mutex);
+    dt_pthread_mutex_unlock(&dev->preview2.pipe->busy_mutex);
+  }
+
+  // Clean up pinned develop
+  if(dev->preview2_pinned && dev->preview2_pinned_dev)
+  {
+    dt_develop_t *pinned_dev = dev->preview2_pinned_dev;
+    
+    pinned_dev->gui_leaving = TRUE;
+    pinned_dev->preview2.widget = NULL;
+    
+    if(pinned_dev->preview2.pipe)
+      dt_atomic_set_int(&pinned_dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
+    if(pinned_dev->preview_pipe)
+      dt_atomic_set_int(&pinned_dev->preview_pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
+    if(pinned_dev->full.pipe)
+      dt_atomic_set_int(&pinned_dev->full.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NODES);
+    
+    if(pinned_dev->preview2.pipe)
+    {
+      dt_pthread_mutex_lock(&pinned_dev->preview2.pipe->mutex);
+      dt_pthread_mutex_unlock(&pinned_dev->preview2.pipe->mutex);
+      dt_pthread_mutex_lock(&pinned_dev->preview2.pipe->busy_mutex);
+      dt_pthread_mutex_unlock(&pinned_dev->preview2.pipe->busy_mutex);
+    }
+    
+    dt_dev_cleanup(pinned_dev);
+    free(pinned_dev);
+    dev->preview2_pinned_dev = NULL;
+    dev->preview2_pinned = FALSE;
+  }
+
+  dev->second_wnd = NULL;
+  dev->preview2.widget = NULL;
+  dev->preview2.pin_button = NULL;
+}
+
 static gboolean _second_window_delete_callback(GtkWidget *widget,
                                                GdkEvent *event,
                                                dt_develop_t *dev)
 {
-  // We need to be careful when using the second window reference from dev. It could be null at this point
+  // Called when user closes window via window manager (X button)
   _darkroom_ui_second_window_write_config(widget);
+  dt_conf_set_bool("second_window/last_visible", FALSE);
 
   // There's a bug in GTK+3 where fullscreen GTK window on macOS may cause EXC_BAD_ACCESS.
-  // We need to unfullscreen the window and consume all pending events first before
-  // destroying the window
   gtk_window_unfullscreen(GTK_WINDOW(widget));
 
-  dev->second_wnd = NULL;
-  dev->preview2.widget = NULL;
+  _darkroom_ui_second_window_cleanup(dev);
 
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(dev->second_wnd_button), FALSE);
 
   return FALSE;
 }
 
+static void _second_window_dnd_received(GtkWidget *widget,
+                                        GdkDragContext *context,
+                                        const gint x,
+                                        const gint y,
+                                        GtkSelectionData *selection_data,
+                                        const guint target_type,
+                                        const guint time,
+                                        gpointer user_data)
+{
+  dt_develop_t *dev = (dt_develop_t *)user_data;
+  gboolean success = FALSE;
+
+  if(selection_data != NULL && target_type == DND_TARGET_IMGID)
+  {
+    const int imgs_nb = gtk_selection_data_get_length(selection_data) / sizeof(dt_imgid_t);
+    if(imgs_nb)
+    {
+      const dt_imgid_t *imgs = (const dt_imgid_t *)gtk_selection_data_get_data(selection_data);
+      if(dt_is_valid_imgid(imgs[0]))
+      {
+        dt_dev_pin_image(dev, imgs[0]);
+        success = TRUE;
+      }
+    }
+  }
+
+  gtk_drag_finish(context, success, FALSE, time);
+}
+
 static void _darkroom_display_second_window(dt_develop_t *dev)
 {
+  // Wait for any pending jobs and reset shutdown flag
+  if(dev->preview2.pipe)
+  {
+    dt_pthread_mutex_lock(&dev->preview2.pipe->mutex);
+    dt_pthread_mutex_unlock(&dev->preview2.pipe->mutex);
+    dt_pthread_mutex_lock(&dev->preview2.pipe->busy_mutex);
+    dt_pthread_mutex_unlock(&dev->preview2.pipe->busy_mutex);
+    dt_atomic_set_int(&dev->preview2.pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
+  }
+    
   if(dev->second_wnd == NULL)
   {
     dev->preview2.width = -1;
@@ -4004,8 +4821,23 @@ static void _darkroom_display_second_window(dt_develop_t *dev)
     gtk_window_set_icon_name(GTK_WINDOW(dev->second_wnd), "darktable");
     gtk_window_set_title(GTK_WINDOW(dev->second_wnd), _("darktable - darkroom preview"));
 
+#ifndef GDK_WINDOWING_QUARTZ
+    // On macOS, transient_for is implemented via [NSWindow addChildWindow:ordered:],
+    // which constrains the child to the parent's screen and prevents it from being
+    // moved to a different monitor.  Use keep_above instead (see below, after show_all,
+    // where the NSWindow is already realized).
+    gtk_window_set_transient_for(GTK_WINDOW(dev->second_wnd),
+                                 GTK_WINDOW(dt_ui_main_window(darktable.gui->ui)));
+#endif
+
+    // Create the overlay for the window
+    GtkWidget *overlay = gtk_overlay_new();
+    gtk_widget_add_events(overlay, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+    gtk_container_add(GTK_CONTAINER(dev->second_wnd), overlay);
+    
+    // Create the drawing area and add it to the overlay
     dev->preview2.widget = gtk_drawing_area_new();
-    gtk_container_add(GTK_CONTAINER(dev->second_wnd), dev->preview2.widget);
+    gtk_container_add(GTK_CONTAINER(overlay), dev->preview2.widget);
     gtk_widget_set_size_request(dev->preview2.widget, DT_PIXEL_APPLY_DPI_2ND_WND(dev, 50), DT_PIXEL_APPLY_DPI_2ND_WND(dev, 200));
     gtk_widget_set_hexpand(dev->preview2.widget, TRUE);
     gtk_widget_set_vexpand(dev->preview2.widget, TRUE);
@@ -4035,15 +4867,30 @@ static void _darkroom_display_second_window(dt_develop_t *dev)
     g_signal_connect(G_OBJECT(dev->preview2.widget), "configure-event",
                      G_CALLBACK(_second_window_configure_callback), dev);
 
+    /* dropping a filmstrip thumbnail pins it in the 2nd window */
+    gtk_drag_dest_set(dev->preview2.widget, GTK_DEST_DEFAULT_ALL,
+                      target_list_internal, n_targets_internal,
+                      GDK_ACTION_COPY | GDK_ACTION_MOVE);
+    g_signal_connect(G_OBJECT(dev->preview2.widget), "drag-data-received",
+                     G_CALLBACK(_second_window_dnd_received), dev);
+
     g_signal_connect(G_OBJECT(dev->second_wnd), "delete-event",
                      G_CALLBACK(_second_window_delete_callback), dev);
     g_signal_connect(G_OBJECT(dev->second_wnd), "event",
                      G_CALLBACK(dt_shortcut_dispatcher), NULL);
 
-    _darkroom_ui_second_window_init(dev->second_wnd, dev);
+    _darkroom_ui_second_window_init(overlay, dev);
   }
 
+  // Show all widgets in the window
   gtk_widget_show_all(dev->second_wnd);
+
+#ifdef GDK_WINDOWING_QUARTZ
+  // keep_above must be set after the window is realized (i.e. after show_all),
+  // because the Quartz backend applies the NSWindow level change only to an
+  // already-existing NSWindow object.
+  gtk_window_set_keep_above(GTK_WINDOW(dev->second_wnd), TRUE);
+#endif
 }
 
 // clang-format off

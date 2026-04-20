@@ -413,7 +413,7 @@ static void _blendif_scale(dt_iop_gui_blend_data_t *data,
       break;
     case IOP_CS_LCH:
       out[CHANNEL_INDEX_C] = (in[1] / _get_boost_factor(data, 3, in_out))
-        / (128.0f * sqrtf(2.0f));
+        / (128.0f * M_SQRT2_F);
       out[CHANNEL_INDEX_h] = in[2] / _get_boost_factor(data, 4, in_out);
       break;
     case IOP_CS_HSL:
@@ -460,7 +460,7 @@ static void _blendif_cook(const dt_iop_colorspace_type_t cst,
       out[CHANNEL_INDEX_B] = in[2] * 100.0f;
       break;
     case IOP_CS_LCH:
-      out[CHANNEL_INDEX_C] = in[1] / (128.0f * sqrtf(2.0f)) * 100.0f;
+      out[CHANNEL_INDEX_C] = in[1] / (128.0f * M_SQRT2_F) * 100.0f;
       out[CHANNEL_INDEX_h] = in[2] * 360.0f;
       break;
     case IOP_CS_HSL:
@@ -1626,6 +1626,14 @@ static gboolean _blendop_masks_add_shape(GtkWidget *widget,
 
   if(this < 0) return FALSE;
 
+#ifdef HAVE_AI
+  if(bd->masks_type[this] == DT_MASKS_OBJECT && !dt_masks_object_available())
+  {
+    dt_control_log(_("AI model is not available. Check preferences > AI"));
+    return TRUE;
+  }
+#endif
+
   _blendop_masks_modes_toggle(NULL, self, DEVELOP_MASK_MASK);
 
   // set all shape buttons to inactive
@@ -2007,13 +2015,8 @@ static void _blendif_hide_output_channels(GtkMenuItem *menuitem,
 }
 
 static void _blendif_options_callback(GtkButton *button,
-                                      GdkEventButton *event,
                                       dt_iop_module_t *module)
 {
-  if(event->button != 1
-     && event->button != 2)
-    return;
-
   const dt_iop_gui_blend_data_t *bd = module->blend_data;
 
   if(!bd
@@ -2673,7 +2676,7 @@ void dt_iop_gui_init_blendif(GtkWidget *blendw, dt_iop_module_t *module)
                                 N_("blend"), N_("boost factor"));
     dt_bauhaus_slider_set_soft_range(bd->channel_boost_factor_slider, 0.0, 3.0);
     gtk_widget_set_tooltip_text(bd->channel_boost_factor_slider,
-                                _("adjust the boost factor of the channel mask"));
+                                _("adjust the channel boost factor.\nincrease to allow matching values over 100%"));
     gtk_widget_set_sensitive(bd->channel_boost_factor_slider, FALSE);
 
     g_signal_connect(G_OBJECT(bd->channel_boost_factor_slider), "value-changed",
@@ -2789,6 +2792,16 @@ void dt_iop_gui_init_masks(GtkWidget *blendw, dt_iop_module_t *module)
                                              FALSE, 0, 0,
                                              dtgtk_cairo_paint_masks_eye, abox);
 
+#ifdef HAVE_AI
+    bd->masks_type[5] = DT_MASKS_OBJECT;
+    bd->masks_shapes[5] = dt_iop_togglebutton_new(module, "blend`shapes",
+                                                  N_("add object"),
+                                                  N_("add AI object"),
+                                                  G_CALLBACK(_blendop_masks_add_shape),
+                                                  FALSE, 0, 0,
+                                                  dtgtk_cairo_paint_masks_object, abox);
+#endif
+
     bd->masks_type[0] = DT_MASKS_GRADIENT;
     bd->masks_shapes[0] = dt_iop_togglebutton_new(module, "blend`shapes",
                                                   N_("add gradient"),
@@ -2796,14 +2809,6 @@ void dt_iop_gui_init_masks(GtkWidget *blendw, dt_iop_module_t *module)
                                                   G_CALLBACK(_blendop_masks_add_shape),
                                                   FALSE, 0, 0,
                                                   dtgtk_cairo_paint_masks_gradient, abox);
-
-    bd->masks_type[4] = DT_MASKS_BRUSH;
-    bd->masks_shapes[4] = dt_iop_togglebutton_new(module, "blend`shapes",
-                                                  N_("add brush"),
-                                                  N_("add multiple brush strokes"),
-                                                  G_CALLBACK(_blendop_masks_add_shape),
-                                                  FALSE, 0, 0,
-                                                  dtgtk_cairo_paint_masks_brush, abox);
 
     bd->masks_type[1] = DT_MASKS_PATH;
     bd->masks_shapes[1] = dt_iop_togglebutton_new(module, "blend`shapes",
@@ -2828,6 +2833,14 @@ void dt_iop_gui_init_masks(GtkWidget *blendw, dt_iop_module_t *module)
                                                   G_CALLBACK(_blendop_masks_add_shape),
                                                   FALSE, 0, 0,
                                                   dtgtk_cairo_paint_masks_circle, abox);
+
+    bd->masks_type[4] = DT_MASKS_BRUSH;
+    bd->masks_shapes[4] = dt_iop_togglebutton_new(module, "blend`shapes",
+                                                  N_("add brush"),
+                                                  N_("add multiple brush strokes"),
+                                                  G_CALLBACK(_blendop_masks_add_shape),
+                                                  FALSE, 0, 0,
+                                                  dtgtk_cairo_paint_masks_brush, abox);
 
     bd->masks_box = GTK_BOX(dt_gui_vbox(hbox, abox));
     _add_wrapped_box(blendw, bd->masks_box, "masks_drawn");
@@ -3476,7 +3489,7 @@ void dt_iop_gui_init_blending(GtkWidget *iopw,
     gtk_widget_set_tooltip_text(presets_button, _("blending options"));
     if(bd->blendif_support)
     {
-      g_signal_connect(G_OBJECT(presets_button), "button-press-event",
+      g_signal_connect(G_OBJECT(presets_button), "clicked",
                        G_CALLBACK(_blendif_options_callback), module);
     }
     else

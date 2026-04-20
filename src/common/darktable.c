@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2025 darktable developers.
+    Copyright (C) 2009-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -53,6 +53,9 @@
 #include "common/undo.h"
 #include "common/gimp.h"
 #include "common/pfm.h"
+#ifdef HAVE_AI
+#include "common/ai_models.h"
+#endif
 #include "control/conf.h"
 #include "control/control.h"
 #include "control/crawler.h"
@@ -69,6 +72,7 @@
 #include "gui/presets.h"
 #include "gui/styles.h"
 #include "gui/splash.h"
+#include "gui/welcome.h"
 #include "imageio/imageio_module.h"
 #include "libs/lib.h"
 #include "lua/init.h"
@@ -663,29 +667,54 @@ void dt_dump_pipe_diff_pfm(
 {
   if(!darktable.dump_diff_pipe) return;
   if(!mod) return;
-  if(!dt_str_commasubstring(darktable.dump_diff_pipe, mod)) return;
 
-  const size_t pk = (size_t)ch * width * height;
-  float *o = dt_calloc_align_float(5 * pk);
+  const size_t lfloats = (size_t)ch * width;
+  const size_t pk = lfloats * (height + 10);
+  const size_t border = lfloats * 5;
+  const size_t pixels = (size_t)width * height * ch;
+  float *o = dt_calloc_align_float(3 * pk);
   if(!o) return;
 
-  DT_OMP_FOR()
-  for(size_t p = 0; p < width * height; p++)
+  float scale = 0.0f;
+  DT_OMP_FOR(reduction(max:scale))
+  for(size_t k = 0; k < pixels; k++)
   {
-    for(size_t c = 0; c < ch; c++)
-    {
-      const size_t k = ch * p +c;
-      if(a[k] > NORM_MIN && b[k] > NORM_MIN)
-      {
-        o[k]      = 0.25f * a[k];
-        o[1*pk+k] = CLIP(50.0f * CLIP(a[k] / b[k] - 1.0f));
-        o[2*pk+k] = CLIP(100.0f * (a[k] - b[k]));
-        o[3*pk+k] = CLIP(50.0f * CLIP(b[k] / a[k] - 1.0f));
-        o[4*pk+k] = CLIP(100.0f * (b[k] - a[k]));
-      }
-    }
+    if(!dt_isnan(b[k]) && fabsf(b[k]) < 1e9)
+      scale = MAX(scale, b[k]);
   }
-  dt_dump_pfm_file(pipe, o, width, 5 * height, ch * sizeof(float), mod, "[dt_dump_CPU/GPU_diff_pfm]", TRUE, TRUE, TRUE);
+  scale = 1.0f / scale;
+
+  int invalids = 0;
+  DT_OMP_FOR(reduction(+:invalids))
+  for(size_t k = 0; k < pixels; k++)
+  {
+    const gboolean any_nan = dt_isnan(a[k]) || dt_isnan(b[k]);
+    const gboolean good = !any_nan && a[k]>-FLT_MAX && a[k]<FLT_MAX && b[k]>-FLT_MAX && b[k]<FLT_MAX;
+    const size_t o1 = k + border;
+    const size_t o2 = k + pk;
+    /* we show a shaded image as background but mark NAN and inf locations */
+    const float shade = good ? 0.05f * sqrtf(CLIP(scale * fmaxf(0.0f, b[k]))) : 0.0f;
+    o[o1] = o[o2] = shade;
+    o[o2 + pk-border] = good ? shade : 1.0f;
+    /* diffs and ratios are only shown if signal is good */
+    if(good)
+    {
+      const float diff = scale * fabsf(a[k] - b[k]);
+      const float cval = scale * fabsf(b[k]);
+      const float gval = scale * fabsf(a[k]);
+      const float quot = cval > 1e-7 && gval > 1e-7
+                          ? ((cval > gval ? cval / gval : gval / cval) - 1.0f)
+                          : 0.0f;
+      if(diff > 1e-7)
+        o[o1] = 0.3f + CLIP(100.0f * sqrtf(diff));
+      if(quot > 1e-3)
+        o[o2] = 0.3f + CLIP(10.0f * quot);
+    }
+    else
+      invalids += 1;
+  }
+  const int out_lines = invalids ? 3 * height + 20 : 2 * height + 15;
+  dt_dump_pfm_file(pipe, o, width, out_lines, ch * sizeof(float), mod, "[dt_dump_CPU/GPU_diff_pfm]", TRUE, TRUE, FALSE);
   dt_free_align(o);
 }
 
@@ -825,15 +854,15 @@ char *version = g_strdup_printf(
 #endif
 
 #ifdef HAVE_GPHOTO2
-               "  gPhoto2                -> ENABLED\n"
+               "  gPhoto2                -> ENABLED  - Camera tethering is available\n"
 #else
-               "  gPhoto2                -> DISABLED - tethering is NOT available\n"
+               "  gPhoto2                -> DISABLED - Camera tethering is NOT available\n"
 #endif
 
 #ifdef HAVE_MAP
-               "  OSMGpsMap              -> ENABLED  - map view is available\n"
+               "  OSMGpsMap              -> ENABLED  - Map view is available\n"
 #else
-               "  OSMGpsMap              -> DISABLED - map view is NOT available\n"
+               "  OSMGpsMap              -> DISABLED - Map view is NOT available\n"
 #endif
 
 #ifdef HAVE_GMIC
@@ -891,9 +920,15 @@ char *version = g_strdup_printf(
 #endif
 
 #ifdef HAVE_WEBP
-               "  WebP                   -> ENABLED\n",
+               "  WebP                   -> ENABLED\n"
 #else
-               "  WebP                   -> DISABLED\n",
+               "  WebP                   -> DISABLED\n"
+#endif
+
+#ifdef HAVE_AI
+               "  AI                     -> ENABLED\n",
+#else
+               "  AI                     -> DISABLED\n",
 #endif
 
                PACKAGE_DOCS,
@@ -1118,6 +1153,7 @@ int dt_init(int argc,
           !strcmp(darg, "pipe") ? DT_DEBUG_PIPE :
           !strcmp(darg, "expose") ? DT_DEBUG_EXPOSE :
           !strcmp(darg, "picker") ? DT_DEBUG_PICKER :
+          !strcmp(darg, "ai") ? DT_DEBUG_AI : // AI related stuff.
           0;
         if(dadd)
           darktable.unmuted |= dadd;
@@ -1389,15 +1425,16 @@ int dt_init(int argc,
     g_free(theversion);
   }
 
-  if(myoptions)
+  if(myoptions && darktable.unmuted)
   {
-    dt_print(DT_DEBUG_ALWAYS, "[dt starting]");
+    dt_print_nts(DT_DEBUG_ALWAYS, "[dt starting] as :");
     int k = 0;
     while(myoptions[k])
       dt_print_nts(DT_DEBUG_ALWAYS, " %s", myoptions[k++]);
     dt_print_nts(DT_DEBUG_ALWAYS, "\n");
-    g_strfreev(myoptions);
   }
+  if(myoptions)
+    g_strfreev(myoptions);
 
   if(darktable.dump_pfm_module
      || darktable.dump_pfm_pipe
@@ -1475,6 +1512,10 @@ int dt_init(int argc,
     g_free(new_xdg_data_dirs);
   }
 
+  // desktop entry name required for mapping application icon to
+  // window for KDE/Plasma on Wayland under GTK 3
+  g_set_prgname("org.darktable.darktable");
+
   setlocale(LC_ALL, "");
   char localedir[PATH_MAX] = { 0 };
   dt_loc_get_localedir(localedir, sizeof(localedir));
@@ -1532,9 +1573,6 @@ int dt_init(int argc,
 
   // set the interface language and prepare selection for prefs & confgen
   darktable.l10n = dt_l10n_init(init_gui);
-
-  const int last_configure_version =
-    dt_conf_get_int("performance_configuration_version_completed");
 
   gboolean has_workspace = FALSE;
 
@@ -1616,8 +1654,10 @@ int dt_init(int argc,
 
   if(init_gui)
   {
-    darktable_splash_screen_create(NULL, FALSE);
+    dt_splash_screen_create(FALSE);
   }
+  const int last_configure_version =
+    dt_conf_get_int("performance_configuration_version_completed");
 
   // detect cpu features and decide which codepaths to enable
   dt_codepaths_init();
@@ -1625,16 +1665,27 @@ int dt_init(int argc,
   // get the list of color profiles
   darktable.color_profiles = dt_colorspaces_init();
 
+#ifdef HAVE_AI
+  // initialize AI models registry
+  darktable.ai_registry = dt_ai_models_init();
+  if(darktable.ai_registry)
+  {
+    dt_ai_models_load_registry(darktable.ai_registry);
+    if(!darktable.ai_registry->ai_enabled)
+      dt_print(DT_DEBUG_AI, "[darktable_ai] AI subsystem is disabled");
+  }
+#endif
+
   // initialize datetime data
   dt_datetime_init();
 
   // initialize the database
-  darktable_splash_screen_set_progress(_("opening image library"));
+  dt_splash_screen_set_progress(_("opening image library"));
   darktable.db = dt_database_init(dbfilename_from_command, load_data, init_gui);
   if(darktable.db == NULL)
   {
     dt_print(DT_DEBUG_ALWAYS, "ERROR : cannot open database");
-    darktable_splash_screen_destroy();
+    dt_splash_screen_destroy();
     return 1;
   }
   else if(!dt_database_get_lock_acquired(darktable.db))
@@ -1642,7 +1693,7 @@ int dt_init(int argc,
     gboolean image_loaded_elsewhere = FALSE;
     if(init_gui && argc > 1)
     {
-      darktable_splash_screen_set_progress(_("forwarding image(s) to running instance"));
+      dt_splash_screen_set_progress(_("forwarding image(s) to running instance"));
 
       // send the images to the other instance via dbus
       dt_print(DT_DEBUG_ALWAYS,
@@ -1666,22 +1717,22 @@ int dt_init(int argc,
       }
       if(connection) g_object_unref(connection);
     }
-    darktable_splash_screen_destroy(); // dismiss splash screen before potentially showing error dialog
-    if(!image_loaded_elsewhere && init_gui) dt_database_show_error(darktable.db);
+    dt_splash_screen_destroy(); // dismiss splash screen before potentially showing error dialog
+    if(!image_loaded_elsewhere && init_gui) dt_database_show_error(darktable.db, dblabel);
 
     dt_print(DT_DEBUG_ALWAYS, "ERROR: can't acquire database lock, aborting.");
     return 1;
   }
 
-  darktable_splash_screen_set_progress(_("preparing database"));
+  dt_splash_screen_set_progress(_("preparing database"));
   dt_upgrade_maker_model(darktable.db);
 
   // init darktable tags table
-  darktable_splash_screen_set_progress(_("setting up tags table"));
+  dt_splash_screen_set_progress(_("setting up tags table"));
   dt_set_darktable_tags();
 
   // Initialize the signal system
-  darktable_splash_screen_set_progress(_("initializing signals and control"));
+  dt_splash_screen_set_progress(_("initializing signals and control"));
   darktable.signals = dt_control_signal_init();
 
   dt_control_init(init_gui);
@@ -1699,8 +1750,7 @@ int dt_init(int argc,
   gchar *styledir = g_build_filename(sharedir, "darktable/styles", NULL);
   if(styledir)
   {
-    dt_gui_process_events();
-    darktable_splash_screen_set_progress(_("importing default styles"));
+    dt_splash_screen_set_progress(_("importing default styles"));
     dt_import_default_styles(styledir);
     g_free(styledir);
   }
@@ -1720,14 +1770,15 @@ int dt_init(int argc,
   {
     if(dt_conf_get_bool("run_crawler_on_start") && !dt_gimpmode())
     {
-      darktable_splash_screen_create(NULL, TRUE); // force the splash screen for the crawl even if user-disabled
+      dt_splash_screen_allow_create(TRUE); // allow splash screen if a message is to be displayed
       // scan for cases where the database and xmp files have different timestamps
       changed_xmp_files = dt_control_crawler_run();
       if(!dt_conf_get_bool("show_splash_screen"))
       {
-        darktable_splash_screen_destroy();
+        dt_splash_screen_destroy();
         dt_gui_process_events(); // ensure that the splash screen is removed right away
       }
+      dt_splash_screen_allow_create(FALSE); // allow splash screen if a message is to be displayed
     }
   }
 
@@ -1743,10 +1794,11 @@ int dt_init(int argc,
      require fixed settings.  reference, mini and notebook require a
      cl capable system with 16GB of ram and 2GB of free video ram
   */
-  static int ref_resources[12] = {
+  static int ref_resources[16] = {
       8192,  32,  512, 2048,   // reference
       1024,   2,  128,  200,   // mini system
       4096,  32,  512, 1024,   // simple notebook with integrated graphics
+     16384,  64, 1024, 5500,   // common2026
   };
 
   /* This is where the sync is to be done if the enum for pref
@@ -1800,7 +1852,7 @@ int dt_init(int argc,
   darktable.guides = dt_guides_init();
 
 #ifdef HAVE_GRAPHICSMAGICK
-  darktable_splash_screen_set_progress(_("initializing GraphicsMagick"));
+  dt_splash_screen_set_progress(_("initializing GraphicsMagick"));
   /* GraphicsMagick init */
 #ifndef MAGICK_OPT_NO_SIGNAL_HANDER
   InitializeMagick(darktable.progname);
@@ -1812,16 +1864,16 @@ int dt_init(int argc,
 #endif
 #elif defined HAVE_IMAGEMAGICK
   /* ImageMagick init */
-  darktable_splash_screen_set_progress(_("initializing ImageMagick"));
+  dt_splash_screen_set_progress(_("initializing ImageMagick"));
   MagickWandGenesis();
 #endif
 
 #ifdef HAVE_LIBHEIF
-  darktable_splash_screen_set_progress(_("initializing libheif"));
+  dt_splash_screen_set_progress(_("initializing libheif"));
   heif_init(NULL);
 #endif
 
-  darktable_splash_screen_set_progress(_("starting OpenCL"));
+  dt_splash_screen_set_progress(_("starting OpenCL"));
   darktable.opencl = (dt_opencl_t *)calloc(1, sizeof(dt_opencl_t));
   if(init_gui)
     dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, _detect_opencl_job_create(exclude_opencl));
@@ -1833,7 +1885,7 @@ int dt_init(int argc,
 
   dt_wb_presets_init(NULL);
 
-  darktable_splash_screen_set_progress(_("loading noise profiles"));
+  dt_splash_screen_set_progress(_("loading noise profiles"));
   darktable.noiseprofile_parser = dt_noiseprofile_init(noiseprofiles_from_command);
 
   // must come before mipmap_cache, because that one will need to access
@@ -1850,16 +1902,19 @@ int dt_init(int argc,
   dt_metadata_init();
   dt_pthread_mutex_unlock(&darktable.metadata_threadsafe);
 
-  darktable_splash_screen_set_progress(_("synchronizing local copies"));
+  dt_splash_screen_set_progress(_("synchronizing local copies"));
   dt_image_local_copy_synch();
 
 #ifdef HAVE_GPHOTO2
   // Initialize the camera control.  this is done late so that the
   // gui can react to the signal sent but before switching to
   // lighttable!
-  darktable_splash_screen_set_progress(_("initializing camera control"));
+  dt_splash_screen_set_progress(_("initializing camera control"));
   darktable.camctl = dt_camctl_new();
 #endif
+
+  darktable.develop = malloc(sizeof(dt_develop_t));
+  dt_dev_init(darktable.develop, TRUE);
 
   // The GUI must be initialized before the views, because the init()
   // functions of the views depend on darktable.control->accels_* to
@@ -1867,11 +1922,11 @@ int dt_init(int argc,
 
   if(init_gui)
   {
-    darktable_splash_screen_set_progress(_("initializing GUI"));
+    dt_splash_screen_set_progress(_("initializing GUI"));
     if(dt_gui_gtk_init(darktable.gui))
     {
       dt_print(DT_DEBUG_ALWAYS, "[dt_init] ERROR: can't init gui, aborting.");
-      darktable_splash_screen_destroy();
+      dt_splash_screen_destroy();
       return 1;
     }
     dt_bauhaus_init();
@@ -1881,26 +1936,15 @@ int dt_init(int argc,
         !dt_gimpmode()
         && dt_get_num_threads() >= 4
         && !(dbfilename_from_command && !strcmp(dbfilename_from_command, ":memory:"));
-  }
-  else
-    darktable.gui = NULL;
 
-  darktable.view_manager = (dt_view_manager_t *)calloc(1, sizeof(dt_view_manager_t));
-  dt_view_manager_init(darktable.view_manager);
-
-  // check whether we were able to load darkroom view. if we failed,
-  // we'll crash everywhere later on.
-  if(!darktable.develop)
-  {
-    dt_print(DT_DEBUG_ALWAYS, "[dt_init] ERROR: can't init develop system, aborting.");
-    darktable_splash_screen_destroy();
-    return 1;
   }
 
-  darktable_splash_screen_set_progress(_("loading processing modules"));
+  dt_splash_screen_set_progress(_("loading image formats"));
+ 
   darktable.imageio = (dt_imageio_t *)calloc(1, sizeof(dt_imageio_t));
   dt_imageio_init(darktable.imageio);
 
+  dt_splash_screen_set_progress(_("loading processing modules"));
   // load default iop order
   darktable.iop_order_list = dt_ioppr_get_iop_order_list(0, FALSE);
   // load iop order rules
@@ -1911,7 +1955,7 @@ int dt_init(int argc,
   if(dt_ioppr_check_so_iop_order(darktable.iop, darktable.iop_order_list))
   {
     dt_print(DT_DEBUG_ALWAYS, "[dt_init] ERROR: iop order looks bad, aborting.");
-    darktable_splash_screen_destroy();
+    dt_splash_screen_destroy();
     return 1;
   }
 
@@ -1932,20 +1976,18 @@ int dt_init(int argc,
 
   if(init_gui)
   {
-    darktable_splash_screen_set_progress(_("loading utility modules"));
+    dt_splash_screen_set_progress(_("loading views"));
+    darktable.view_manager = (dt_view_manager_t *)calloc(1, sizeof(dt_view_manager_t));
+    dt_view_manager_init(darktable.view_manager);
+
+    dt_splash_screen_set_progress(_("loading utility modules"));
     darktable.lib = (dt_lib_t *)calloc(1, sizeof(dt_lib_t));
     dt_lib_init(darktable.lib);
-
-    // init the gui part of views
-    darktable_splash_screen_set_progress(_("loading views"));
-    dt_view_manager_gui_init(darktable.view_manager);
   }
 
 /* init lua last, since it's user made stuff it must be in the real environment */
 #ifdef USE_LUA
-  darktable_splash_screen_set_progress(_("initializing Lua"));
-  // after the following Lua startup call, we can no longer use dt_gui_process_events() or we hang;
-  // this also means no more calls to darktable_splash_screen_set_progress()
+  dt_splash_screen_set_progress(_("initializing Lua"));
   dt_lua_init(darktable.lua_state.state, lua_command);
 #endif
 
@@ -1974,9 +2016,7 @@ int dt_init(int argc,
     if(argc == 2 && !_is_directory(argv[1]))
     {
       // If only one image is listed, attempt to load it in darkroom
-#ifndef USE_LUA      // may cause UI hang since after LUA init
-      darktable_splash_screen_set_progress(_("importing image"));
-#endif
+      dt_splash_screen_set_progress(_("importing image"));
       dt_load_from_string(argv[1], TRUE, NULL);
     }
     else if(argc >= 2)
@@ -2005,16 +2045,27 @@ int dt_init(int argc,
         dt_conf_set_int("performance_configuration_version_completed",
                       DT_CURRENT_PERFORMANCE_CONFIGURE_VERSION);
       }
+
+      if(changed_xmp_files)
+      {
+        // construct the popup that asks the user how to handle images whose xmp
+        // files are newer than the db entry
+        dt_control_crawler_show_image_list(changed_xmp_files);
+      }
     }
+
+    // show the main window and restore its geometry to that saved in the config file
+    gtk_widget_show_all(dt_ui_main_window(darktable.gui->ui));
+    dt_gui_gtk_load_config();
+    dt_gui_process_events();
+    dt_splash_screen_destroy();
+    dt_welcome_screen_run_if_needed();
+
+    // finally set the cursor to be the default.
+    // for some reason this is needed on some systems to pick up the correctly themed cursor
+    dt_control_change_cursor("default");
   }
   free(config_info);
-
-  if(init_gui && !dt_gimpmode() && changed_xmp_files)
-  {
-    // construct the popup that asks the user how to handle images whose xmp
-    // files are newer than the db entry
-    dt_control_crawler_show_image_list(changed_xmp_files);
-  }
 
   // fire up a background job to perform sidecar writes
   dt_control_sidecar_synch_start();
@@ -2028,18 +2079,6 @@ int dt_init(int argc,
   dt_capabilities_add("linux");
   dt_capabilities_add("nonapple");
 #endif
-
-  if(init_gui)
-  {
-    // show the main window and restore its geometry to that saved in the config file
-    gtk_widget_show_all(dt_ui_main_window(darktable.gui->ui));
-    dt_gui_gtk_load_config();
-    darktable_splash_screen_destroy();
-
-    // finally set the cursor to be the default.
-    // for some reason this is needed on some systems to pick up the correctly themed cursor
-    dt_control_change_cursor(GDK_LEFT_PTR);
-  }
 
   dt_print(DT_DEBUG_CONTROL,
            "[dt_init] startup took %f seconds", dt_get_wtime() - start_wtime);
@@ -2073,6 +2112,7 @@ void dt_get_sysresource_level()
     else if(!strcmp(config, "reference"))    level = -1;
     else if(!strcmp(config, "mini"))         level = -2;
     else if(!strcmp(config, "notebook"))     level = -3;
+    else if(!strcmp(config, "common2026"))   level = -4;
   }
 
   if(level != oldlevel)
@@ -2092,9 +2132,6 @@ void dt_get_sysresource_level()
 void dt_cleanup()
 {
   const gboolean init_gui = (darktable.gui != NULL);
-
-//  if(init_gui)
-//    darktable_exit_screen_create(NULL, FALSE);
 
   dt_stop_backthumbs_crawler(TRUE);
 
@@ -2182,6 +2219,10 @@ void dt_cleanup()
   dt_mipmap_cache_cleanup();
 
   dt_colorspaces_cleanup(darktable.color_profiles);
+#ifdef HAVE_AI
+  dt_ai_models_cleanup(darktable.ai_registry);
+  darktable.ai_registry = NULL;
+#endif
   dt_conf_cleanup(darktable.conf);
   free(darktable.conf);
   darktable.conf = NULL;
@@ -2273,9 +2314,6 @@ void dt_cleanup()
   dt_pthread_mutex_destroy(&(darktable.metadata_threadsafe));
 
   dt_exif_cleanup();
-
-  if(init_gui)
-    darktable_exit_screen_destroy();
 }
 
 /* The dt_print variations can be used with a combination of DT_DEBUG_ flags.
@@ -2468,7 +2506,7 @@ void dt_configure_runtime_performance(const int old, char *info)
     dt_conf_set_bool("cache_disk_backend_full", largedisk);
     dt_print(DT_DEBUG_DEV,
              "[dt_configure_runtime_performance] cache_disk_backend_full=%s",
-             (largedisk) ? "TRUE" : "FALSE");
+             STR_TRUEFALSE(largedisk));
   }
 
   gboolean updated_mandatory = FALSE;
@@ -2562,6 +2600,16 @@ void dt_configure_runtime_performance(const int old, char *info)
   {
     g_strlcat(info, INFO_HEADER, DT_PERF_INFOSIZE);
     g_strlcat(info, _("OpenCL mandatory timeout has been updated to 1000.\n\n"), DT_PERF_INFOSIZE);
+  }
+
+  if(old == 18)
+  {
+    g_strlcat(info, INFO_HEADER, DT_PERF_INFOSIZE);
+    g_strlcat(info, _("OpenCL 'per device' settings have changed.\n\n"), DT_PERF_INFOSIZE);
+    g_strlcat(info, _("you will find 'per device' data in 'cldevice_v6_canonical-name'. content is:"), DT_PERF_INFOSIZE);
+    g_strlcat(info, "\n  ", DT_PERF_INFOSIZE);
+    g_strlcat(info, _(" 'micro_nap' 'pinned_memory' 'eventhandles' 'async' 'disabled' 'advantage' 'unified_fraction'"), DT_PERF_INFOSIZE);
+    g_strlcat(info, "\n\n", DT_PERF_INFOSIZE);
   }
 
   #undef INFO_HEADER

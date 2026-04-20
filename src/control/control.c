@@ -203,7 +203,6 @@ void dt_control_init(const gboolean withgui)
   s->input_drivers = NULL;
   dt_atomic_set_int(&s->quitting, 0);
   dt_atomic_set_int(&s->pending_jobs, 0);
-  dt_atomic_set_int(&s->running_jobs, 0);
   s->cups_started = FALSE;
 
   dt_action_define_fallback(DT_ACTION_TYPE_IOP, &dt_action_def_iop);
@@ -221,7 +220,6 @@ void dt_control_init(const gboolean withgui)
   // same thread as init
   s->gui_thread = pthread_self();
 
-  // s->last_expose_time = dt_get_wtime();
   s->log_pos = s->log_ack = 0;
   s->busy = 0;
   s->log_message_timeout_id = 0;
@@ -256,15 +254,79 @@ void dt_control_allow_change_cursor()
   darktable.control->lock_cursor_shape = FALSE;
 }
 
-void dt_control_change_cursor(dt_cursor_t curs)
+// last cursor set by dt_control_change_cursor() or a direct call to
+// gdk_window_set_cursor() outside of functions below
+static GdkCursor* _prev_cursor = NULL;
+
+void _change_cursor_with_fallback(const char *cursor_name,
+                                  gboolean is_temp)
 {
   GdkWindow *window = gtk_widget_get_window(dt_ui_main_window(darktable.gui->ui));
-  if(!darktable.control->lock_cursor_shape && window)
+  if(!window) return;
+  GdkDisplay *display = gdk_window_get_display(window);
+  GdkCursor *cursor = gdk_cursor_new_from_name(display, cursor_name);
+
+  // GTK3 fallback: some CSS cursor names are not supported by all
+  // backends (e.g. "wait" and "help" are missing from the GTK3 Win32
+  // mapping table despite Windows having IDC_WAIT and IDC_HELP;
+  // "none" is missing from both the Win32 and X11 backends).
+  // Fall back to the legacy GdkCursorType enum API for these cases.
+  // TODO(GTK4): remove this fallback when migrating to GTK4, where
+  // all backends support the full CSS cursor name spec.
+  if(!cursor)
   {
-    GdkCursor *cursor = gdk_cursor_new_for_display(gdk_window_get_display(window), curs);
+    GdkCursorType type = GDK_LEFT_PTR;
+    if(!strcmp(cursor_name, "none"))           type = GDK_BLANK_CURSOR;
+    else if(!strcmp(cursor_name, "wait"))      type = GDK_WATCH;
+    else if(!strcmp(cursor_name, "grab"))      type = GDK_HAND1;
+    else if(!strcmp(cursor_name, "cell"))      type = GDK_PLUS;
+    else if(!strcmp(cursor_name, "help"))      type = GDK_QUESTION_ARROW;
+    else if(!strcmp(cursor_name, "ns-resize")) type = GDK_DOUBLE_ARROW;
+    cursor = gdk_cursor_new_for_display(display, type);
+  }
+
+  if(!is_temp && _prev_cursor)
+  {
+    // cursor change request via dt_control_change_cursor() is overriden
+    // by temp cursor, save new cursor to use when clear temp cursor
+    g_object_unref(_prev_cursor);
+    _prev_cursor = g_object_ref(cursor);
+  }
+  else if(!darktable.control->lock_cursor_shape)
+  {
     gdk_window_set_cursor(window, cursor);
     g_object_unref(cursor);
   }
+}
+
+void dt_control_set_temp_cursor(const char *cursor_name)
+{
+  GdkWindow *window = gtk_widget_get_window(dt_ui_main_window(darktable.gui->ui));
+  if(!window) return;
+  // store cursor to return to once clear temp cursor if this is the
+  // initial setup of this temp cursor (as can call this multiple
+  // times to vary a temp cursor)
+  if(!_prev_cursor)
+  {
+    _prev_cursor = gdk_window_get_cursor(window);
+    g_object_ref(_prev_cursor);
+  }
+  _change_cursor_with_fallback(cursor_name, TRUE);
+}
+
+void dt_control_clear_temp_cursor()
+{
+  GdkWindow *window = gtk_widget_get_window(dt_ui_main_window(darktable.gui->ui));
+  if(!_prev_cursor) return;
+  if(window)
+    gdk_window_set_cursor(window, _prev_cursor);
+  g_object_unref(_prev_cursor);
+  _prev_cursor = NULL;
+}
+
+void dt_control_change_cursor(const char *cursor_name)
+{
+  _change_cursor_with_fallback(cursor_name, FALSE);
 }
 
 /* Some implementation and how-to use notes about control->running
@@ -558,6 +620,13 @@ void dt_ctl_switch_mode()
   dt_ctl_switch_mode_to(mode);
 }
 
+static void _control_log_redraw()
+{
+  if(dt_control_running())
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_LOG_REDRAW);
+}
+
+
 static gboolean _dt_ctl_log_message_timeout_callback(gpointer data)
 {
   dt_control_t *dc = darktable.control;
@@ -565,8 +634,29 @@ static gboolean _dt_ctl_log_message_timeout_callback(gpointer data)
   dc->log_ack = dc->log_pos;
   dc->log_message_timeout_id = 0;
   dt_pthread_mutex_unlock(&dc->log_mutex);
-  dt_control_log_redraw();
+  _control_log_redraw();
   return FALSE;
+}
+
+void dt_control_log_ack_all(void)
+{
+  if(!dt_control_running()) return;
+  dt_control_t *dc = darktable.control;
+  dt_pthread_mutex_lock(&dc->log_mutex);
+  if(dc->log_message_timeout_id)
+  {
+    g_source_remove(dc->log_message_timeout_id);
+    dc->log_message_timeout_id = 0;
+  }
+  dc->log_ack = dc->log_pos;
+  dt_pthread_mutex_unlock(&dc->log_mutex);
+  _control_log_redraw();
+}
+
+static void _control_toast_redraw()
+{
+  if(dt_control_running())
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_TOAST_REDRAW);
 }
 
 static gboolean _dt_ctl_toast_message_timeout_callback(gpointer data)
@@ -576,7 +666,7 @@ static gboolean _dt_ctl_toast_message_timeout_callback(gpointer data)
   dc->toast_ack = dc->toast_pos;
   dc->toast_message_timeout_id = 0;
   dt_pthread_mutex_unlock(&dc->log_mutex);
-  dt_control_toast_redraw();
+  _control_toast_redraw();
   return FALSE;
 }
 
@@ -642,8 +732,8 @@ void dt_control_button_pressed(double x,
 
 static gboolean _redraw_center(gpointer user_data)
 {
-  dt_control_log_redraw();
-  dt_control_toast_redraw();
+  _control_log_redraw();
+  _control_toast_redraw();
   return FALSE; // don't call this again
 }
 
@@ -745,29 +835,20 @@ void dt_control_busy_leave()
 
 void dt_control_queue_redraw()
 {
-  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_REDRAW_ALL);
+  if(dt_control_running())
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_REDRAW_ALL);
 }
 
 void dt_control_queue_redraw_center()
 {
-  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_REDRAW_CENTER);
+  if(dt_control_running())
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_REDRAW_CENTER);
 }
 
 void dt_control_navigation_redraw()
 {
-  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_NAVIGATION_REDRAW);
-}
-
-void dt_control_log_redraw()
-{
   if(dt_control_running())
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_LOG_REDRAW);
-}
-
-void dt_control_toast_redraw()
-{
-  if(dt_control_running())
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_TOAST_REDRAW);
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_NAVIGATION_REDRAW);
 }
 
 static int _widget_queue_draw(void *widget)

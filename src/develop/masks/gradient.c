@@ -315,7 +315,7 @@ static void _gradient_init_values(const float zoom_scale,
                                                        pts[4] - pts[0]);
   // Normalize to the range -180 to 180 degrees
   check_angle = atan2f(sinf(check_angle), cosf(check_angle));
-  if(check_angle < 0.0f) rot -= M_PI;
+  if(check_angle < 0.0f) rot -= M_PI_F;
 
   const float compr =
     MIN(1.0f, dt_conf_get_float(DT_MASKS_CONF(0, gradient, compression)));
@@ -694,14 +694,14 @@ static int _gradient_get_points(dt_develop_t *dev,
 
   float wd, ht;
   dt_masks_get_image_size(NULL, NULL, &wd, &ht);
-  const float scale = sqrtf(wd * wd + ht * ht);
+  const float scale = dt_fast_hypotf(wd, ht);
   const float distance = 0.1f * fminf(wd, ht);
 
   const float v = deg2radf(-rotation);
   const float cosv = cosf(v);
   const float sinv = sinf(v);
 
-  const int count = sqrtf(wd * wd + ht * ht) + 3;
+  const int count = scale + 3;
   *points = dt_alloc_align_float((size_t)2 * count);
   if(*points == NULL) return 0;
 
@@ -795,7 +795,7 @@ static int _gradient_get_pts_border(dt_develop_t *dev,
 
   float wd, ht;
   dt_masks_get_image_size(NULL, NULL, &wd, &ht);
-  const float scale = sqrtf(wd * wd + ht * ht);
+  const float scale = dt_fast_hypotf(wd, ht);
 
   const float v1 = deg2radf(-(rotation - 90.0f));
 
@@ -963,7 +963,7 @@ static void _gradient_draw_arrow(cairo_t *cr,
 
   // start side of the gradient (this is the control point for
   // rotating the gradient).
-  cairo_arc(cr, pivot_start_x, pivot_start_y, 3.0f / zoom_scale, 0, 2.0f * M_PI);
+  cairo_arc(cr, pivot_start_x, pivot_start_y, 3.0f / zoom_scale, 0, DT_2PI_F);
   cairo_fill_preserve(cr);
 
   dt_masks_line_stroke(cr, FALSE, FALSE, selected, zoom_scale);
@@ -1169,7 +1169,7 @@ static int _gradient_get_mask(const dt_iop_module_t *const module,
   // we calculate the mask at grid points and recycle point buffer to store results
   const float wd = piece->pipe->iwidth;
   const float ht = piece->pipe->iheight;
-  const float hwscale = 1.0f / sqrtf(wd * wd + ht * ht);
+  const float hwscale = 1.0f / dt_fast_hypotf(wd, ht);
   const float ihwscale = 1.0f / hwscale;
   const float v = deg2radf(-gradient->rotation);
   const float sinv = sinf(v);
@@ -1321,7 +1321,7 @@ static int _gradient_get_mask_roi(const dt_iop_module_t *const module,
   // we calculate the mask at grid points and recycle point buffer to store results
   const float wd = piece->pipe->iwidth;
   const float ht = piece->pipe->iheight;
-  const float hwscale = 1.0f / sqrtf(wd * wd + ht * ht);
+  const float hwscale = 1.0f / dt_fast_hypotf(wd, ht);
   const float ihwscale = 1.0f / hwscale;
   const float v = deg2radf(-gradient->rotation);
   const float sinv = sinf(v);
@@ -1485,48 +1485,57 @@ static void _gradient_modify_property(dt_masks_form_t *const form,
 
   switch(prop)
   {
-    case DT_MASKS_PROPERTY_CURVATURE:;
-      float curvature = gradient
-        ? gradient->curvature
-        : dt_conf_get_float(DT_MASKS_CONF(form->type, gradient, curvature));
-      curvature = CLAMP(curvature + new_val - old_val, -2.0f, 2.0f);
+    case DT_MASKS_PROPERTY_CURVATURE:
+      {
+        float curvature = gradient
+          ? gradient->curvature
+          : dt_conf_get_float(DT_MASKS_CONF(form->type, gradient, curvature));
+        curvature = CLAMP(curvature + 2.0f * (new_val - old_val), -2.0f, 2.0f);
 
-      if(gradient) gradient->curvature = curvature;
-      dt_conf_set_float(DT_MASKS_CONF(form->type, gradient, curvature), curvature);
+        if(gradient) gradient->curvature = curvature;
+        dt_conf_set_float(DT_MASKS_CONF(form->type, gradient, curvature), curvature);
 
-      *sum += curvature * 0.5;
-      *max = fminf(*max,  1.0f - 0.5 * curvature);
-      *min = fmaxf(*min, -1.0f - 0.5 * curvature);
-      ++*count;
+        *sum += curvature * 0.5;
+        *max = fminf(*max,  1.0f - 0.5 * curvature);
+        *min = fmaxf(*min, -1.0f - 0.5 * curvature);
+        ++*count;
+      }
       break;
-    case DT_MASKS_PROPERTY_COMPRESSION:;
-      const float ratio = (!old_val || !new_val) ? 1.0f : new_val / old_val;
-      float compression = gradient
-        ? gradient->compression
-        : dt_conf_get_float(DT_MASKS_CONF(form->type, gradient, compression));
-      compression = CLAMP(compression * ratio, 0.001f, 1.0f);
 
-      if(gradient) gradient->compression = compression;
-      dt_conf_set_float(DT_MASKS_CONF(form->type, gradient, compression), compression);
+    case DT_MASKS_PROPERTY_COMPRESSION:
+      {
+        const float ratio = (!old_val || !new_val) ? 1.0f : new_val / old_val;
+        float compression = gradient
+          ? gradient->compression
+          : dt_conf_get_float(DT_MASKS_CONF(form->type, gradient, compression));
+        compression = CLAMP(compression * ratio, 0.001f, 1.0f);
 
-      *sum += compression;
-      *max = fminf(*max, 1.0f / compression);
-      *min = fmaxf(*min, 0.0005f / compression);
-      ++*count;
+        if(gradient) gradient->compression = compression;
+        dt_conf_set_float(DT_MASKS_CONF(form->type, gradient, compression), compression);
+
+        *sum += compression;
+        *max = fminf(*max, 1.0f / compression);
+        *min = fmaxf(*min, 0.0005f / compression);
+        ++*count;
+      }
       break;
-    case DT_MASKS_PROPERTY_ROTATION:;
-      float rotation = gradient
-        ? gradient->rotation
-        : dt_conf_get_float(DT_MASKS_CONF(form->type, gradient, rotation));
-      rotation = fmodf(rotation - new_val + old_val + 360.0f, 360.0f);
 
-      if(gradient) gradient->rotation = rotation;
-      dt_conf_set_float(DT_MASKS_CONF(form->type, gradient, rotation), rotation);
+    case DT_MASKS_PROPERTY_ROTATION:
+      {
+        float rotation = gradient
+          ? gradient->rotation
+          : dt_conf_get_float(DT_MASKS_CONF(form->type, gradient, rotation));
+        rotation = fmodf(rotation - new_val + old_val + 360.0f, 360.0f);
 
-      *sum += 360.0f - rotation;
-      ++*count;
+        if(gradient) gradient->rotation = rotation;
+        dt_conf_set_float(DT_MASKS_CONF(form->type, gradient, rotation), rotation);
+
+        *sum += 360.0f - rotation;
+        ++*count;
+      }
       break;
-    default:;
+
+    default: {}
   }
 }
 

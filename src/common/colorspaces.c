@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2025 darktable developers.
+    Copyright (C) 2010-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -35,6 +35,11 @@
 
 #ifdef USE_COLORDGTK
 #include "colord-gtk.h"
+#endif
+
+#ifdef _WIN32
+#include <dwmapi.h>
+#include <gdk/gdkwin32.h>
 #endif
 
 #if 0
@@ -1732,9 +1737,9 @@ const char *dt_colorspaces_get_name(dt_colorspaces_color_profile_type_t type,
   switch(type)
   {
      case DT_COLORSPACE_NONE:
-       return NULL;
+       return _("none");
      case DT_COLORSPACE_FILE:
-       return filename;
+       return filename && filename[0] ? filename : _("no filename");
      case DT_COLORSPACE_SRGB:
        return _("sRGB");
      case DT_COLORSPACE_ADOBERGB:
@@ -2009,7 +2014,25 @@ void dt_colorspaces_set_display_profile
   profile_source = g_strdup("osx color profile api");
 #endif
 #elif defined G_OS_WIN32
-  HDC hdc = GetDC(NULL);
+  GtkWidget *widget = (profile_type == DT_COLORSPACE_DISPLAY2)
+      ? darktable.develop->second_wnd
+      : dt_ui_center(darktable.gui->ui);
+  GdkWindow *window = gtk_widget_get_window(widget);
+  HWND hwnd = (HWND)gdk_win32_window_get_handle(window);  // get window handle
+  HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST); // get monitor handle
+  if(!hMonitor)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[win32 dt_colorspaces_set_display_profile] error getting monitor handle");
+    return;
+  }
+  MONITORINFOEX monitorInfo;
+  monitorInfo.cbSize = sizeof(MONITORINFOEX);
+  if(!GetMonitorInfoW(hMonitor, (LPMONITORINFO) &monitorInfo))  //get monitor info
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[win32 dt_colorspaces_set_display_profile] error getting monitor info");
+    return;
+  }
+  HDC hdc = CreateIC(L"MONITOR", monitorInfo.szDevice, NULL, NULL); // get device-info context of the monitor
   if(hdc != NULL)
   {
     DWORD len = 0;
@@ -2028,7 +2051,7 @@ void dt_colorspaces_set_display_profile
       }
     }
     g_free(wpath);
-    ReleaseDC(NULL, hdc);
+    DeleteDC(hdc);
   }
   profile_source = g_strdup("windows color profile api");
 #endif
@@ -2536,6 +2559,55 @@ void dt_make_transposed_matrices_from_primaries_and_whitepoint(const float prima
 
   for(size_t i = 0; i < 3; i++)
     for(size_t j = 0; j < 3; j++) RGB_to_XYZ_transposed[i][j] = scale[i] * primaries_matrix[i][j];
+}
+
+// exhaustive switch with no default: when dt_colorspaces_color_profile_type_t
+// gains a new value, the compiler warns and forces this list to be updated;
+// DT_COLORSPACE_NONE and DT_COLORSPACE_FILE require additional context and are
+// handled by callers
+gboolean dt_colorspaces_profile_is_wide_gamut(const dt_colorspaces_color_profile_type_t type)
+{
+  switch(type)
+  {
+    // wider than sRGB
+    case DT_COLORSPACE_ADOBERGB:
+    case DT_COLORSPACE_PROPHOTO_RGB:
+    case DT_COLORSPACE_LIN_REC2020:
+    case DT_COLORSPACE_PQ_REC2020:
+    case DT_COLORSPACE_HLG_REC2020:
+    case DT_COLORSPACE_PQ_P3:
+    case DT_COLORSPACE_HLG_P3:
+    case DT_COLORSPACE_DISPLAY_P3:
+      return TRUE;
+
+    // sRGB primaries (gamma may differ but gamut is the same)
+    case DT_COLORSPACE_SRGB:
+    case DT_COLORSPACE_REC709:
+    case DT_COLORSPACE_LIN_REC709:
+      return FALSE;
+
+    // non-RGB / internal / pseudo profiles — not wide-gamut
+    case DT_COLORSPACE_NONE:
+    case DT_COLORSPACE_FILE:
+    case DT_COLORSPACE_XYZ:
+    case DT_COLORSPACE_LAB:
+    case DT_COLORSPACE_INFRARED:
+    case DT_COLORSPACE_DISPLAY:
+    case DT_COLORSPACE_DISPLAY2:
+    case DT_COLORSPACE_EMBEDDED_ICC:
+    case DT_COLORSPACE_EMBEDDED_MATRIX:
+    case DT_COLORSPACE_STANDARD_MATRIX:
+    case DT_COLORSPACE_ENHANCED_MATRIX:
+    case DT_COLORSPACE_VENDOR_MATRIX:
+    case DT_COLORSPACE_ALTERNATE_MATRIX:
+    case DT_COLORSPACE_BRG:
+    case DT_COLORSPACE_EXPORT:
+    case DT_COLORSPACE_SOFTPROOF:
+    case DT_COLORSPACE_WORK:
+    case DT_COLORSPACE_LAST:
+      return FALSE;
+  }
+  return FALSE;
 }
 
 // clang-format off

@@ -214,6 +214,7 @@ typedef struct _filter_t
 #include "libs/filters/history.c"
 #include "libs/filters/iso.c"
 #include "libs/filters/local_copy.c"
+#include "libs/filters/duplicates.c"
 #include "libs/filters/misc.c"
 #include "libs/filters/module_order.c"
 #include "libs/filters/rating.c"
@@ -226,6 +227,7 @@ static _filter_t filters[]
         { DT_COLLECTION_PROP_FILENAME, _filename_widget_init, _filename_update },
         { DT_COLLECTION_PROP_TEXTSEARCH, _search_widget_init, _search_update },
         { DT_COLLECTION_PROP_DAY, _date_widget_init, _date_update },
+        { DT_COLLECTION_PROP_MONTH, _month_widget_init, _month_update },
         { DT_COLLECTION_PROP_CHANGE_TIMESTAMP, _date_widget_init, _date_update },
         { DT_COLLECTION_PROP_EXPORT_TIMESTAMP, _date_widget_init, _date_update },
         { DT_COLLECTION_PROP_TIME, _date_widget_init, _date_update },
@@ -239,6 +241,7 @@ static _filter_t filters[]
         { DT_COLLECTION_PROP_EXPOSURE, _exposure_widget_init, _exposure_update },
         { DT_COLLECTION_PROP_EXPOSURE_BIAS, _exposure_bias_widget_init, _exposure_bias_update },
         { DT_COLLECTION_PROP_GROUP_ID, _misc_widget_init, _misc_update },
+        { DT_COLLECTION_PROP_DUPLICATES, _duplicates_widget_init, _duplicates_update },
         { DT_COLLECTION_PROP_LOCAL_COPY, _local_copy_widget_init, _local_copy_update },
         { DT_COLLECTION_PROP_HISTORY, _history_widget_init, _history_update },
         { DT_COLLECTION_PROP_ORDER, _module_order_widget_init, _module_order_update },
@@ -867,7 +870,7 @@ static void _popup_add_item(GtkMenuShell *pop, const gchar *name, const int id, 
     g_object_set_data(G_OBJECT(smt), "collect_id", GINT_TO_POINTER(id));
     g_object_set_data(G_OBJECT(smt), "topbar", GINT_TO_POINTER(0));
     if(data) g_object_set_data(G_OBJECT(smt), "collect_data", data);
-    g_signal_connect(G_OBJECT(smt), "activate", callback, self);
+    g_signal_connect_data(G_OBJECT(smt), "activate", callback, self, NULL, 0);
   }
   gtk_menu_shell_append(pop, smt);
 }
@@ -898,6 +901,7 @@ static gboolean _rule_show_popup(GtkWidget *widget, dt_lib_filtering_rule_t *rul
 
   _popup_add_item(spop, _("times"), 0, TRUE, NULL, NULL, self, 0.0);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_DAY);
+  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_MONTH);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_TIME);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_IMPORT_TIMESTAMP);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_CHANGE_TIMESTAMP);
@@ -920,6 +924,7 @@ static gboolean _rule_show_popup(GtkWidget *widget, dt_lib_filtering_rule_t *rul
 
   _popup_add_item(spop, _("darktable"), 0, TRUE, NULL, NULL, self, 0.0);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_GROUP_ID);
+  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_DUPLICATES);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_LOCAL_COPY);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_HISTORY);
   ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_MODULE);
@@ -957,6 +962,7 @@ static void _populate_rules_combo(GtkWidget *w)
 
   dt_bauhaus_combobox_add_section(w, _("times"));
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_DAY);
+  ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_MONTH);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_TIME);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_IMPORT_TIMESTAMP);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_CHANGE_TIMESTAMP);
@@ -979,6 +985,7 @@ static void _populate_rules_combo(GtkWidget *w)
 
   dt_bauhaus_combobox_add_section(w, _("darktable"));
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_GROUP_ID);
+  ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_DUPLICATES);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_LOCAL_COPY);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_HISTORY);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_MODULE);
@@ -1211,7 +1218,7 @@ static gboolean _event_rule_close(GtkWidget *widget, GdkEventButton *event, dt_l
 static gboolean _rule_available_for_topbar(const dt_collection_properties_t prop)
 {
   // we don't want to allow date filters for topbar as the design of the bar is not useful as it
-  if(prop == DT_COLLECTION_PROP_DAY || prop == DT_COLLECTION_PROP_TIME
+  if(prop == DT_COLLECTION_PROP_DAY || prop == DT_COLLECTION_PROP_MONTH || prop == DT_COLLECTION_PROP_TIME
      || prop == DT_COLLECTION_PROP_CHANGE_TIMESTAMP || prop == DT_COLLECTION_PROP_EXPORT_TIMESTAMP
      || prop == DT_COLLECTION_PROP_PRINT_TIMESTAMP || prop == DT_COLLECTION_PROP_IMPORT_TIMESTAMP)
     return FALSE;
@@ -1443,13 +1450,14 @@ static void _dt_collection_updated(gpointer instance, dt_collection_change_t que
   {
     g_free(d->last_where_ext);
     d->last_where_ext = where_ext;
-    for(int i = 0; i <= d->nb_rules; i++)
-    {
-      _widget_update(&d->rule[i]);
-    }
   }
   else
     g_free(where_ext);
+
+  for(int i = 0; i <= d->nb_rules; i++)
+  {
+    _widget_update(&d->rule[i]);
+  }
 }
 
 static void _history_pretty_print(const char *buf, char *out, size_t outsize)
@@ -1506,6 +1514,8 @@ static void _history_pretty_print(const char *buf, char *out, size_t outsize)
       gchar *pretty = NULL;
       if(item == DT_COLLECTION_PROP_COLORLABEL)
         pretty = _colors_pretty_print(str);
+      else if(item == DT_COLLECTION_PROP_MONTH)
+        pretty = _month_pretty_print(str);
       else if(!g_strcmp0(str, "%"))
         pretty = g_strdup(_("all"));
       else
@@ -1644,6 +1654,7 @@ static void _topbar_populate_rules_combo(GtkWidget *w, dt_lib_filtering_t *d)
   dt_bauhaus_combobox_add_section(w, _("darktable"));
   nb = dt_bauhaus_combobox_length(w);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_GROUP_ID);
+  ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_DUPLICATES);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_LOCAL_COPY);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_HISTORY);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_MODULE);

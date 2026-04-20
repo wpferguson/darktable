@@ -37,7 +37,7 @@ add_library(filtering MODULE "filtering.c")
 add_library(metadata MODULE "metadata.c")
 add_library(metadata_view MODULE "metadata_view.c")
 add_library(navigation MODULE "navigation.c")
-add_library(histogram MODULE "histogram.c")
+add_library(histogram MODULE "histogram.c" "scopes/histogram.c" "scopes/waveform.c" "scopes/vectorscope.c" "scopes/split.c")
 add_library(history MODULE "history.c")
 add_library(snapshots MODULE "snapshots.c")
 add_library(modulegroups MODULE "modulegroups.c")
@@ -112,6 +112,13 @@ if(CUPS_FOUND)
   add_library(print_settings MODULE "print_settings.c")
   set(MODULES ${MODULES} print_settings)
 endif(CUPS_FOUND)
+
+# AI neural restore module
+if(USE_AI)
+  add_library(neural_restore MODULE "neural_restore.c")
+  target_link_libraries(neural_restore TIFF::TIFF)
+  set(MODULES ${MODULES} neural_restore)
+endif(USE_AI)
 
 # Add libs references
 foreach(module ${MODULES})

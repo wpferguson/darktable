@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2009-2025 darktable developers.
+    Copyright (C) 2009-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -183,7 +183,7 @@ invert_1f(read_only image2d_t in, write_only image2d_t out, const int width, con
   const float pixel = read_imagef(in, sampleri, (int2)(x, y)).x;
   const float inv_pixel = color[FC(ry+y, rx+x, filters)] - pixel;
 
-  write_imagef (out, (int2)(x, y), (float4)(clamp(inv_pixel, 0.0f, 1.0f), 0.0f, 0.0f, 0.0f));
+  write_imagef (out, (int2)(x, y), (float4)(clipf(inv_pixel), 0.0f, 0.0f, 0.0f));
 }
 
 kernel void
@@ -204,35 +204,35 @@ invert_4f(read_only image2d_t in, write_only image2d_t out, const int width, con
 
 kernel void
 whitebalance_1f(read_only image2d_t in, write_only image2d_t out, const int width, const int height, global float *coeffs,
-    const unsigned int filters, const int rx, const int ry, global const unsigned char (*const xtrans)[6])
+    const unsigned int filters, global const unsigned char (*const xtrans)[6])
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
   if(x >= width || y >= height) return;
-  const float pixel = read_imagef(in, sampleri, (int2)(x, y)).x;
-  write_imagef (out, (int2)(x, y), (float4)(pixel * coeffs[FC(ry+y, rx+x, filters)], 0.0f, 0.0f, 0.0f));
+  float pixel = readsingle(in, x, y);
+  write_imagef(out, (int2)(x, y), pixel * coeffs[FC(y, x, filters)]);
 }
 
 kernel void
 whitebalance_1f_xtrans(read_only image2d_t in, write_only image2d_t out, const int width, const int height, global float *coeffs,
-    const unsigned int filters, const int rx, const int ry, global const unsigned char (*const xtrans)[6])
+    const unsigned int filters, global const unsigned char (*const xtrans)[6])
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
   if(x >= width || y >= height) return;
-  const float pixel = read_imagef(in, sampleri, (int2)(x, y)).x;
-  write_imagef (out, (int2)(x, y), (float4)(pixel * coeffs[FCxtrans(ry+y, rx+x, xtrans)], 0.0f, 0.0f, 0.0f));
+  float pixel = readsingle(in, x, y);
+  write_imagef(out, (int2)(x, y), pixel * coeffs[FCxtrans(y, x, xtrans)]);
 }
 
 
 kernel void
 whitebalance_4f(read_only image2d_t in, write_only image2d_t out, const int width, const int height, global float *coeffs,
-    const unsigned int filters, const int rx, const int ry, global const unsigned char (*const xtrans)[6])
+    const unsigned int filters, global const unsigned char (*const xtrans)[6])
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
   if(x >= width || y >= height) return;
-  const float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
+  float4 pixel = readpixel(in, x, y);
   write_imagef (out, (int2)(x, y), (float4)(pixel.x * coeffs[0], pixel.y * coeffs[1], pixel.z * coeffs[2], pixel.w));
 }
 
@@ -244,15 +244,14 @@ exposure (read_only image2d_t in, write_only image2d_t out, const int width, con
   const int y = get_global_id(1);
 
   if(x >= width || y >= height) return;
-  float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
+  float4 pixel = readpixel(in, x, y);
   pixel.xyz = ((pixel - black ) * scale).xyz;
   write_imagef (out, (int2)(x, y), pixel);
 }
 
 /* kernel for the highlights plugin. */
 kernel void
-highlights_4f_clip (read_only image2d_t in, write_only image2d_t out, const int width, const int height,
-                    const int mode, const float clip)
+highlights_4f_clip (read_only image2d_t in, write_only image2d_t out, const int width, const int height, const float clip)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
@@ -261,7 +260,7 @@ highlights_4f_clip (read_only image2d_t in, write_only image2d_t out, const int 
 
   // 4f/pixel means that this has been debayered already.
   // it's thus hopeless to recover highlights here (this code path is just used for preview and non-raw images)
-  float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
+  float4 pixel = readpixel(in, x, y);
   // default: // 0, DT_IOP_HIGHLIGHTS_CLIP
   pixel.x = fmin(clip, pixel.x);
   pixel.y = fmin(clip, pixel.y);
@@ -273,7 +272,7 @@ kernel void
 highlights_1f_clip (read_only image2d_t in, write_only image2d_t out,
                     const int iwidth, const int iheight,
                     const int owidth, const int oheight,
-                    global float *clips, const int dx, const int dy,
+                    const float4 clip, const int dx, const int dy,
                     const int filters, global const unsigned char (*const xtrans)[6])
 {
   const int x = get_global_id(0);
@@ -284,93 +283,86 @@ highlights_1f_clip (read_only image2d_t in, write_only image2d_t out,
   const int irow = y + dy;
   const int icol = x + dx;
   float pixel = 0.0f;
+  float clips[4] = { clip.x, clip.y, clip.z, clip.w};
   if((icol >= 0) && (irow >= 0) && (irow < iheight) && (icol < iwidth))
   {
-    const int color = (filters == 9u) ? FCxtrans(irow, icol, xtrans) : FC(irow, icol, filters);
-    pixel = read_imagef(in, sampleri, (int2)(icol, irow)).x;
+    const int color = fcol(irow, icol, filters, xtrans);
+    pixel = readsingle(in, icol, irow);
     pixel = fmin(clips[color], pixel);
   }
-  write_imagef (out, (int2)(x, y), pixel);
+  write_imagef(out, (int2)(x, y), pixel);
 }
 
-kernel void highlights_false_color(
-        read_only image2d_t in,
-        write_only image2d_t out,
-        const int owidth,
-        const int oheight,
-        const int iwidth,
-        const int iheight,
-        const int rx,
-        const int ry,
-        const unsigned int filters,
-        global const unsigned char (*const xtrans)[6],
-        global const float *clips)
+kernel void highlights_false_color(read_only image2d_t in,
+                                   write_only image2d_t out,
+                                   const int owidth,
+                                   const int oheight,
+                                   const int iwidth,
+                                   const int iheight,
+                                   const int dx,
+                                   const int dy,
+                                   const unsigned int filters,
+                                   global const unsigned char (*const xtrans)[6],
+                                   const float4 clip)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
 
   if(x >= owidth || y >= oheight) return;
 
-  const int irow = y + ry;
-  const int icol = x + rx;
+  const int irow = y + dy;
+  const int icol = x + dx;
   float oval = 0.0f;
+  float clips[4] = { clip.x, clip.y, clip.z, clip.w};
 
   if((irow >= 0) && (icol >= 0) && (icol < iwidth) && (irow < iheight))
   {
-    const float ival = read_imagef(in, sampleri, (int2)(icol, irow)).x;
-    const int c = (filters == 9u) ? FCxtrans(irow, icol, xtrans) : FC(irow, icol, filters);
+    const float ival = readsingle(in, icol, irow);
+    const int c = fcol(irow, icol, filters, xtrans);
     oval = (ival < clips[c]) ? 0.2f * ival : 1.0f;
   }
   write_imagef (out, (int2)(x, y), oval);
 }
 
-static float _calc_refavg(
-        read_only image2d_t in,
-        global const unsigned char (*const xtrans)[6],
-        const unsigned int filters,
-        int row,
-        int col,
-        int maxrow,
-        int maxcol,
-        global const float *correction)
+static float _calc_refavg(read_only image2d_t in,
+                          global const unsigned char (*const xtrans)[6],
+                          const unsigned int filters,
+                          int row,
+                          int col,
+                          int maxrow,
+                          int maxcol,
+                          global const float *correction)
 {
   float mean[3] = { 0.0f, 0.0f, 0.0f };
-  float sum[3] =  { 0.0f, 0.0f, 0.0f };
   float cnt[3]  = { 0.0f, 0.0f, 0.0f };
 
-  const int dymin = max(0, row - 1);
-  const int dxmin = max(0, col - 1);
-  const int dymax = min(maxrow - 1, row + 2);
-  const int dxmax = min(maxcol - 1, col + 2);
-
-  for(int dy = dymin; dy < dymax; dy++)
+  for(int dy = max(0, row - 1); dy < min(maxrow - 1, row + 2); dy++)
   {
-    for(int dx = dxmin; dx < dxmax; dx++)
+    for(int dx = max(0, col - 1); dx < min(maxcol - 1, col + 2); dx++)
     {
-      const float val = fmax(0.0f, read_imagef(in, samplerA, (int2)(dx, dy)).x);
+      const float val = fmax(0.0f, readsingle(in, dx, dy));
       const int c = fcol(dy, dx, filters, xtrans);
-      sum[c] += val;
+      mean[c] += val;
       cnt[c] += 1.0f;
     }
   }
 
   for(int c = 0; c < 3; c++)
-    mean[c] = (cnt[c] > 0.0f) ? dtcl_pow((correction[c] * sum[c]) / cnt[c], 0.33333333333f) : 0.0f;
+    mean[c] = (cnt[c] > 0.0f) ? cbrt((correction[c] * mean[c]) / cnt[c]) : 0.0f;
 
-  const float croot_refavg[3] = { 0.5f * (mean[1] + mean[2]), 0.5f * (mean[0] + mean[2]), 0.5f * (mean[0] + mean[1])};
-  const int color = fcol(row, col, filters, xtrans);
-  return dtcl_pow(croot_refavg[color], 3.0f);
+  float croot_refavg[3] = { 0.5f * (mean[1] + mean[2]), 0.5f * (mean[0] + mean[2]), 0.5f * (mean[0] + mean[1])};
+  int color = fcol(row, col, filters, xtrans);
+  return fcube(croot_refavg[color]);
 }
 
-kernel void highlights_initmask(
-        read_only image2d_t in,
-        global char *inmask,
-        const int msize,
-        const int mwidth,
-        const int mheight,
-        const unsigned int filters,
-        global const unsigned char (*const xtrans)[6],
-        global const float *clips)
+kernel void highlights_initmask(read_only image2d_t in,
+                                global char *inmask,
+                                const int msize,
+                                const int mwidth,
+                                const int mheight,
+                                const unsigned int filters,
+                                global const unsigned char (*const xtrans)[6],
+                                global const float *clips)
 {
   const int mcol = get_global_id(0);
   const int mrow = get_global_id(1);
@@ -378,36 +370,49 @@ kernel void highlights_initmask(
   if((mcol >= mwidth) || (mrow >= mheight))
     return;
 
-  const int mdx = mad24(mrow, mwidth, mcol);
-
-  if((mcol < 1) || (mrow < 1) || (mcol > mwidth -2) || (mrow > mheight-2))
-  {
-    for(int c = 0; c < 3; c++)
-      inmask[c*msize + mdx] = 0;
-    return;
-  }
-
+  int mdx = mad24(mrow, mwidth, mcol);
   char mbuff[3] = { 0, 0, 0 };
-  for(int y = -1; y < 2; y++)
+  if(mcol < mwidth-1 && mrow < mheight-1)
   {
-    for(int x = -1; x < 2; x++)
+    for(int y = 0; y < 3; y++)
     {
-      const int color = fcol(mrow+y, mcol+x, filters, xtrans);
-      const float val = fmax(0.0f, read_imagef(in, samplerA, (int2)(3 * mcol + x, 3 * mrow + y)).x);
-      mbuff[color] += (val >= clips[color]) ? 1 : 0;
+      for(int x = 0; x < 3; x++)
+      {
+        int color = fcol(3*mrow+y, 3*mcol+x, filters, xtrans);
+        float val = readsingle(in, 3*mcol+x, 3*mrow+y);
+        mbuff[color] += (val >= clips[color]) ? 1 : 0;
+      }
     }
   }
 
   for(int c = 0; c < 3; c++)
-    inmask[c*msize + mdx] = (mbuff[c] != 0) ? 1 : 0;
+    inmask[c*msize + mdx] = mbuff[c] ? 1 : 0;
 }
 
-kernel void highlights_dilatemask(
-        global char *in,
-        global char *out,
-        const int msize,
-        const int mwidth,
-        const int mheight)
+static char _mask_dilated(global char *in, const int w1)
+{
+  if(in[0])
+    return 1;
+
+  if(in[-w1-1] | in[-w1] | in[-w1+1] | in[-1] | in[1] | in[w1-1] | in[w1] | in[w1+1])
+    return 1;
+
+  const int w2 = 2*w1;
+  const int w3 = 3*w1;
+  return (in[-w3-2] | in[-w3-1] | in[-w3]   | in[-w3+1] | in[-w3+2] |
+          in[-w2-3] | in[-w2-2] | in[-w2-1] | in[-w2]   | in[-w2+1] | in[-w2+2] | in[-w2+3] |
+          in[-w1-3] | in[-w1-2] | in[-w1+2] | in[-w1+3] |
+          in[-3]    | in[-2]    | in[2]     | in[3]     |
+          in[w1-3]  | in[w1-2]  | in[w1+2]  | in[w1+3]  |
+          in[w2-3]  | in[w2-2]  | in[w2-1]  | in[w2]    | in[w2+1]  | in[w2+2]  | in[w2+3] |
+          in[w3-2]  | in[w3-1]  | in[w3]    | in[w3+1]  | in[w3+2]) ? 1 : 0;
+}
+
+kernel void highlights_dilatemask(global char *in,
+                                  global char *out,
+                                  const int msize,
+                                  const int mwidth,
+                                  const int mheight)
 {
   const int col = get_global_id(0);
   const int row = get_global_id(1);
@@ -415,86 +420,38 @@ kernel void highlights_dilatemask(
   if((col >= mwidth) || (row >= mheight))
     return;
 
-  const int w1 = mwidth;
-  const int w2 = 2 * mwidth;
-  const int w3 = 3 * mwidth;
-  const int moff = mad24(row, w1, col);
+  int mx = mad24(row, mwidth, col);
+  bool safe = col >= 3 && row >= 3 && col < mwidth - 4 && row < mheight - 4;
 
-  if((col < 3) || (row < 3) || (col > mwidth - 4) || (row > mheight - 4))
-  {
-    out[moff] = 0;
-    out[moff + msize] = 0;
-    out[moff + 2*msize] = 0;
-    return;
-  }
-
-  int i = moff;
-  out[i] = (in[i-w1-1] | in[i-w1] | in[i-w1+1] |
-         in[i-1]    | in[i]    | in[i+1] |
-         in[i+w1-1] | in[i+w1] | in[i+w1+1] |
-         in[i-w2-1] | in[i-w2] | in[i-w2+1] |
-         in[i-w1-2] | in[i-w1+2] | in[i-2]    | in[i+2] | in[i+w1-2] | in[i+w1+2] |
-         in[i+w2-1] | in[i+w2]   | in[i+w2+1] |
-         in[i-w3-2] | in[i-w3-1] | in[i-w3] | in[i-w3+1] | in[i-w3+2] |
-         in[i-w2-3] | in[i-w2-2] | in[i-w2+2] | in[i-w2+3] |
-         in[i-w1-3] | in[i-w1+3] | in[i-3] | in[i+3] | in[i+w1-3] | in[i+w1+3] |
-         in[i+w2-3] | in[i+w2-2] | in[i+w2+2] | in[i+w2+3] |
-         in[i+w3-2] | in[i+w3-1] | in[i+w3] | in[i+w3+1] | in[i+w3+2]) ? 1 : 0;
-
-  i = msize + moff;
-  out[i] = (in[i-w1-1] | in[i-w1] | in[i-w1+1] |
-         in[i-1]    | in[i]    | in[i+1] |
-         in[i+w1-1] | in[i+w1] | in[i+w1+1] |
-         in[i-w2-1] | in[i-w2] | in[i-w2+1] |
-         in[i-w1-2] | in[i-w1+2] | in[i-2]    | in[i+2] | in[i+w1-2] | in[i+w1+2] |
-         in[i+w2-1] | in[i+w2]   | in[i+w2+1] |
-         in[i-w3-2] | in[i-w3-1] | in[i-w3] | in[i-w3+1] | in[i-w3+2] |
-         in[i-w2-3] | in[i-w2-2] | in[i-w2+2] | in[i-w2+3] |
-         in[i-w1-3] | in[i-w1+3] | in[i-3] | in[i+3] | in[i+w1-3] | in[i+w1+3] |
-         in[i+w2-3] | in[i+w2-2] | in[i+w2+2] | in[i+w2+3] |
-         in[i+w3-2] | in[i+w3-1] | in[i+w3] | in[i+w3+1] | in[i+w3+2]) ? 1 : 0;
-
-  i = 2*msize + moff;
-  out[i] = (in[i-w1-1] | in[i-w1] | in[i-w1+1] |
-         in[i-1]    | in[i]    | in[i+1] |
-         in[i+w1-1] | in[i+w1] | in[i+w1+1] |
-         in[i-w2-1] | in[i-w2] | in[i-w2+1] |
-         in[i-w1-2] | in[i-w1+2] | in[i-2]    | in[i+2] | in[i+w1-2] | in[i+w1+2] |
-         in[i+w2-1] | in[i+w2]   | in[i+w2+1] |
-         in[i-w3-2] | in[i-w3-1] | in[i-w3] | in[i-w3+1] | in[i-w3+2] |
-         in[i-w2-3] | in[i-w2-2] | in[i-w2+2] | in[i-w2+3] |
-         in[i-w1-3] | in[i-w1+3] | in[i-3] | in[i+3] | in[i+w1-3] | in[i+w1+3] |
-         in[i+w2-3] | in[i+w2-2] | in[i+w2+2] | in[i+w2+3] |
-         in[i+w3-2] | in[i+w3-1] | in[i+w3] | in[i+w3+1] | in[i+w3+2]) ? 1 : 0;
+  out[mx] =         safe ? _mask_dilated(in + mx, mwidth)           : in[mx];
+  out[mx+msize] =   safe ? _mask_dilated(in + mx + msize, mwidth)   : in[mx + msize];
+  out[mx+2*msize] = safe ? _mask_dilated(in + mx + 2*msize, mwidth) : in[mx + 2*msize];
 }
 
-
-kernel void highlights_chroma(
-        read_only image2d_t in,
-        global char *mask,
-        global float *accu,
-        const int width,
-        const int height,
-        const int msize,
-        const int mwidth,
-        const unsigned int filters,
-        global const unsigned char (*const xtrans)[6],
-        global const float *clips,
-        global const float *correction)
+kernel void highlights_chroma(read_only image2d_t in,
+                              global char *mask,
+                              global float *accu,
+                              const int width,
+                              const int height,
+                              const int msize,
+                              const int mwidth,
+                              const unsigned int filters,
+                              global const unsigned char (*const xtrans)[6],
+                              global const float *clips,
+                              global const float *correction)
 {
   const int row = get_global_id(0);
-
-  if((row < 3) || (row > height - 4)) return;
+  if(row >= height) return;
 
   float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   float cnt[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
   float clipped = 0.0f;
-  for(int col = 3; col < width-4; col++)
+  for(int col = 0; col < width; col++)
   {
     const int idx = mad24(row, width, col);
     const int color = fcol(row, col, filters, xtrans);
-    const float inval = fmax(0.0f, read_imagef(in, samplerA, (int2)(col, row)).x);
+    const float inval = readsingle(in, col, row);
     const int px = color * msize + mad24(row/3, mwidth, col/3);
     if(mask[px] && (inval > 0.2f*clips[color]) && (inval < clips[color]))
     {
@@ -507,42 +464,38 @@ kernel void highlights_chroma(
 
   for(int c = 0; c < 3; c++)
   {
-    if(cnt[c] > 0.0f)
-    {
-      accu[row*8 + 2*c] = sum[c];
-      accu[row*8 + 2*c +1] = cnt[c];
-    }
+    accu[row*8 + 2*c] = sum[c];
+    accu[row*8 + 2*c +1] = cnt[c];
   }
   accu[row*8 + 6] = clipped;
 }
 
-kernel void highlights_opposed(
-        read_only image2d_t in,
-        write_only image2d_t out,
-        const int owidth,
-        const int oheight,
-        const int iwidth,
-        const int iheight,
-        const int dx,
-        const int dy,
-        const unsigned int filters,
-        global const unsigned char (*const xtrans)[6],
-        global const float *clips,
-        global const float *chroma,
-        global const float *correction,
-        const int fastcopymode)
+kernel void highlights_opposed(read_only image2d_t in,
+                               write_only image2d_t out,
+                               const int owidth,
+                               const int oheight,
+                               const int iwidth,
+                               const int iheight,
+                               const int dx,
+                               const int dy,
+                               const unsigned int filters,
+                               global const unsigned char (*const xtrans)[6],
+                               global const float *clips,
+                               global const float *chroma,
+                               global const float *correction,
+                               const int fastcopymode)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
   if(x >= owidth || y >= oheight) return;
 
-  const int irow = y + dy;
-  const int icol = x + dx;
+  int irow = y + dy;
+  int icol = x + dx;
   float val = 0.0f;
 
   if((icol >= 0) && (icol < iwidth) && (irow >= 0) && (irow < iheight))
   {
-    val = fmax(0.0f, read_imagef(in, samplerA, (int2)(icol, irow)).x);
+    val = readsingle(in, icol, irow);
 
     if(!fastcopymode)
     {
@@ -561,7 +514,7 @@ kernel void highlights_opposed(
 #define SQRT12 3.4641016151377545870548926830117447339f // 2*SQRT3
 kernel void
 highlights_1f_lch_bayer (read_only image2d_t in, write_only image2d_t out, const int width, const int height,
-                         const float clip, const int rx, const int ry, const int filters)
+                         const float clip, const int filters)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
@@ -580,13 +533,13 @@ highlights_1f_lch_bayer (read_only image2d_t in, write_only image2d_t out, const
   {
     for(int ii = 0; ii <= 1; ii++)
     {
-      const float val = read_imagef(in, sampleri, (int2)(x+ii, y+jj)).x;
+      const float val = readsingle(in, x+ii, y+jj);
 
       pixel = (ii == 0 && jj == 0) ? val : pixel;
 
       clipped = (clipped || (val > clip));
 
-      const int c = FC(y + jj + ry, x + ii + rx, filters);
+      const int c = FC(y + jj, x + ii, filters);
 
       switch(c)
       {
@@ -632,7 +585,7 @@ highlights_1f_lch_bayer (read_only image2d_t in, write_only image2d_t out, const
      * result:
      * [[R == 1/6*sqrt(3)*C - 1/6*H + L, G == -1/6*sqrt(3)*C - 1/6*H + L, B == 1/3*H + L]]
      */
-    const int c = FC(y + ry, x + rx, filters);
+    const int c = FC(y, x, filters);
     C = (c == 1) ? -C : C;
 
     pixel = L;
@@ -645,7 +598,7 @@ highlights_1f_lch_bayer (read_only image2d_t in, write_only image2d_t out, const
 
 kernel void
 highlights_1f_lch_xtrans (read_only image2d_t in, write_only image2d_t out, const int width, const int height,
-                         const float clip, const int rx, const int ry, global const unsigned char (*const xtrans)[6],
+                         const float clip, global const unsigned char (*const xtrans)[6],
                          local float *buffer)
 {
   const int x = get_global_id(0);
@@ -678,7 +631,7 @@ highlights_1f_lch_xtrans (read_only image2d_t in, write_only image2d_t out, cons
     if(bufidx >= maxbuf) continue;
     const int xx = xul + bufidx % stride;
     const int yy = yul + bufidx / stride;
-    buffer[bufidx] = read_imagef(in, sampleri, (int2)(xx, yy)).x;
+    buffer[bufidx] = readsingle(in, xx, yy);
   }
 
   // center buffer around current x,y-Pixel
@@ -740,7 +693,7 @@ highlights_1f_lch_xtrans (read_only image2d_t in, write_only image2d_t out, cons
         for(int ii = -1; ii <= 1; ii++)
         {
           const float val = buffer[mad24(jj, stride, ii)];
-          const int c = FCxtrans(y + jj + ry, x + ii + rx, xtrans);
+          const int c = FCxtrans(y + jj, x + ii, xtrans);
           mean[c] += val;
           cnt[c]++;
           RGBmax[c] = fmax(RGBmax[c], val);
@@ -775,7 +728,7 @@ highlights_1f_lch_xtrans (read_only image2d_t in, write_only image2d_t out, cons
       RGB[1] = L - H / 6.0f - C / SQRT12;
       RGB[2] = L + H / 3.0f;
 
-      pixel = RGB[FCxtrans(y + ry, x + rx, xtrans)];
+      pixel = RGB[FCxtrans(y, x, xtrans)];
     }
     else
       pixel = buffer[0];
@@ -802,7 +755,7 @@ interpolate_and_mask(read_only image2d_t input,
   const int i = get_global_id(1); // = y
 
   if(j >= width || i >= height) return;
-  const float center = read_imagef(input, sampleri, (int2)(j, i)).x;
+  const float center = fmax(0.0f, read_imagef(input, sampleri, (int2)(j, i)).x);
 
   const int c = FC(i, j, filters);
 
@@ -1003,10 +956,10 @@ kernel void interpolate_bilinear(read_only image2d_t in,
   y_next = (y_next < height_in) ? y_next : height_in - 1;
 
   // Nearest pixels in input array (nodes in grid)
-  const float4 Q_NW = read_imagef(in, samplerA, (int2)(x_prev, y_prev));
-  const float4 Q_NE = read_imagef(in, samplerA, (int2)(x_next, y_prev));
-  const float4 Q_SE = read_imagef(in, samplerA, (int2)(x_next, y_next));
-  const float4 Q_SW = read_imagef(in, samplerA, (int2)(x_prev, y_next));
+  const float4 Q_NW = read_imagef(in, sampleri, (int2)(x_prev, y_prev));
+  const float4 Q_NE = read_imagef(in, sampleri, (int2)(x_next, y_prev));
+  const float4 Q_SE = read_imagef(in, sampleri, (int2)(x_next, y_next));
+  const float4 Q_SW = read_imagef(in, sampleri, (int2)(x_prev, y_next));
 
   // Spatial differences between nodes
   const float Dy_next = (float)y_next - y_in;
@@ -2726,7 +2679,7 @@ kernel void md_vignette(read_only image2d_t in,
   const float cx = ((float)(roix + x) - w2);
   const float cy = ((float)(roiy + y) - h2);
   const float4 spline =
-    _interpolate_linear_spline(knots_vig, vig, knots, r * sqrt(cx*cx + cy*cy));
+    _interpolate_linear_spline(knots_vig, vig, knots, r * dt_fast_hypot(cx, cy));
 
   float4 pixel  = read_imagef(in, sampleri, (int2)(x, y));
   pixel /= fmax(1e-4, spline);
@@ -2755,7 +2708,7 @@ kernel void lens_man_vignette(read_only image2d_t in,
 
   const float dx = ((float)(roix + x) - w2);
   const float dy = ((float)(roiy + y) - h2);
-  const float radius = sqrt(dx*dx + dy*dy) * inv_maxr;
+  const float radius = dt_fast_hypot(dx, dy) * inv_maxr;
   const float4 val = fmax(0.0f, intensity * _calc_vignette_spline(radius, spline, splinesize));
 
   float4 pixel  = read_imagef(in, samplerA, (int2)(x, y));
@@ -3057,7 +3010,7 @@ kernel void md_lens_correction(read_only image2d_t in,
 
   const float cx = ((float)(roox + x) - w2) / scale;
   const float cy = ((float)(rooy + y) - h2) / scale;
-  const float radius = r * sqrt(cx*cx + cy*cy);
+  const float radius = r * dt_fast_hypot(cx, cy);
   const float limw = (float)iwidth - 1.0f;
   const float limh = (float)iheight - 1.0f;
   float output[4];
@@ -3290,12 +3243,12 @@ colorzones_v3 (read_only image2d_t in,
 
   if(x >= width || y >= height) return;
 
-  float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
+  float4 pixel = readpixel(in, x, y);
 
   const float a = pixel.y;
   const float b = pixel.z;
-  const float h = fmod(atan2(b, a) + 2.0f*M_PI_F, 2.0f*M_PI_F)/(2.0f*M_PI_F);
-  const float C = sqrt(b*b + a*a);
+  const float h = fmod(atan2(b, a) + DT_2PI_F, DT_2PI_F) / DT_2PI_F;
+  const float C = dt_fast_hypot(b, a);
 
   float select = 0.0f;
   float blend = 0.0f;
@@ -3311,7 +3264,7 @@ colorzones_v3 (read_only image2d_t in,
     default:
     case DT_IOP_COLORZONES_h:
       select = h;
-      blend = pow(1.0f - C/128.0f, 2.0f);
+      blend = fsquare(1.0f - C/128.0f);
       break;
   }
 
@@ -3320,11 +3273,11 @@ colorzones_v3 (read_only image2d_t in,
   blend *= blend; // saturation isn't as prone to artifacts:
   // const float Cm = 2.0f* (blend*0.5f + (1.0f-blend)*lookup(d->lut[1], select));
   const float Cm = 2.0f * lookup(table_a, select);
-  const float L = pixel.x * pow(2.0f, 4.0f*Lm);
+  const float L = pixel.x * dtcl_pow(2.0f, 4.0f*Lm);
 
   pixel.x = L;
-  pixel.y = cos(2.0f*M_PI_F*(h + hm)) * Cm * C;
-  pixel.z = sin(2.0f*M_PI_F*(h + hm)) * Cm * C;
+  pixel.y = dtcl_cos(DT_2PI_F*(h + hm)) * Cm * C;
+  pixel.z = dtcl_sin(DT_2PI_F*(h + hm)) * Cm * C;
 
   write_imagef (out, (int2)(x, y), pixel);
 }
@@ -3344,10 +3297,10 @@ colorzones (read_only image2d_t in,
 
   if(x >= width || y >= height) return;
 
-  float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
+  float4 pixel = readpixel(in, x, y);
 
   float4 LCh;
-  const float normalize_C = 1.f / (128.0f * sqrt(2.f));
+  const float normalize_C = 1.f / (128.0f * M_SQRT2_F);
 
   LCh = Lab_2_LCH(pixel);
 
@@ -3555,10 +3508,7 @@ rawoverexposed_mark_cfa (read_only image2d_t in,
 
   const uint raw_pixel = read_imageui(raw, sampleri, (int2)(raw_x, raw_y)).x;
 
-  const int c = (filters == 9u)
-    ? FCxtrans(raw_y, raw_x, xtrans)
-    : FC(raw_y, raw_x, filters);
-
+  const int c = fcol(raw_y, raw_x, filters, xtrans);
   if(raw_pixel < threshold[c]) return;
 
   float4 pixel = fmax(0.0f, read_imagef(in, sampleri, (int2)(x, y)));
@@ -3598,10 +3548,7 @@ rawoverexposed_mark_solid (read_only image2d_t in,
 
   const uint raw_pixel = read_imageui(raw, sampleri, (int2)(raw_x, raw_y)).x;
 
-  const int c = (filters == 9u)
-    ? FCxtrans(raw_y, raw_x, xtrans)
-    : FC(raw_y, raw_x, filters);
-
+  const int c = fcol(raw_y, raw_x, filters, xtrans);
   if(raw_pixel < threshold[c]) return;
 
   float4 pixel = fmax(0.0f, read_imagef(in, sampleri, (int2)(x, y)));
@@ -3640,10 +3587,7 @@ rawoverexposed_falsecolor (read_only image2d_t in,
 
   const uint raw_pixel = read_imageui(raw, sampleri, (int2)(raw_x, raw_y)).x;
 
-  const int c = (filters == 9u)
-    ? FCxtrans(raw_y, raw_x, xtrans)
-    : FC(raw_y, raw_x, filters);
-
+  const int c = fcol(raw_y, raw_x, filters, xtrans);
   if(raw_pixel < threshold[c]) return;
 
   float4 pixel = fmax(0.0f, read_imagef(in, sampleri, (int2)(x, y)));
@@ -3906,7 +3850,7 @@ interpolation_copy(read_only image2d_t dev_in,
   const int irow = orow + dy;
   const int icol = ocol + dx;
 
-  if(irow < iheight && icol < iwidth)
+  if(irow < iheight && irow >= 0 && icol < iwidth && icol >= 0)
   {
     pix = read_imagef(dev_in, samplerA, (int2)(icol, irow));
   }

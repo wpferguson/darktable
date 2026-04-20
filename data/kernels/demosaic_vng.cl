@@ -19,59 +19,16 @@
 #include "common.h"
 
 kernel void
-#define AVGWINDOW 1
-
-vng_border_interpolate(read_only image2d_t in,
-                       write_only image2d_t out,
-                       const int width,
-                       const int height,
-                       const int border,
-                       const unsigned int filters,
-                       global const unsigned char (*const xtrans)[6])
-{
-  const int x = get_global_id(0);
-  const int y = get_global_id(1);
-
-  if(x >= width || y >= height) return;
-
-  const int colors = (filters == 9) ? 3 : 4;
-
-  if(x >= border && x < width-border && y >= border && y < height-border) return;
-
-  float o[4] = { 0.0f };
-  float sum[4] = { 0.0f };
-  int count[4] = { 0 };
-
-  for(int j = y-AVGWINDOW; j <= y+AVGWINDOW; j++)
-    for(int i = x-AVGWINDOW; i <= x+AVGWINDOW; i++)
-    {
-      if(j >= 0 && i >= 0 && j < height && i < width)
-      {
-        const int f = fcol(j, i, filters, xtrans);
-        sum[f] += fmax(0.0f, read_imagef(in, samplerA, (int2)(i, j)).x);
-        count[f]++;
-      }
-    }
-
-  const float i = read_imagef(in, sampleri, (int2)(x, y)).x;
-  const int f = fcol(y, x, filters, xtrans);
-
-  for(int c = 0; c < colors; c++)
-  {
-    if(c != f && count[c] != 0)
-      o[c] = sum[c] / count[c];
-    else
-      o[c] = fmax(i, 0.0f);
-  }
-
-  write_imagef (out, (int2)(x, y), (float4)(o[0], o[1], o[2], o[3]));
-}
-
-
-kernel void
-vng_lin_interpolate(read_only image2d_t in, write_only image2d_t out, const int width, const int height,
-                    const unsigned int filters, global const int (*const lookup)[16][32],
-                    local float *buffer)
+vng_lin_interpolate(read_only image2d_t in,
+                    write_only image2d_t out,
+                    const int width,
+                    const int height,
+                    const int border,
+                    const unsigned int filters,
+                    global const unsigned char (*const xtrans)[6],
+                    global const int (*const lookup)[16][32],
+                    local float *buffer,
+                    const int only_linear)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
@@ -102,52 +59,94 @@ vng_lin_interpolate(read_only image2d_t in, write_only image2d_t out, const int 
     if(bufidx >= maxbuf) continue;
     const int xx = xul + bufidx % stride;
     const int yy = yul + bufidx / stride;
-    buffer[bufidx] = fmax(0.0f, read_imagef(in, sampleri, (int2)(xx, yy)).x);
+    buffer[bufidx] = fmax(0.0f, readsingle(in, xx, yy));
   }
 
   // center buffer around current x,y-Pixel
   buffer += mad24(ylid + 1, stride, xlid + 1);
 
   barrier(CLK_LOCAL_MEM_FENCE);
+  if(x >= width || y >= height) return;
 
-  if(x < 1 || x >= width-1 || y < 1 || y >= height-1) return;
+  if(border > 0 && x > border && y > border && x <= width - border && y <= height - border)
+    return;
 
-  const int colors = (filters == 9) ? 3 : 4;
-  const int size = (filters == 9) ? 6 : 16;
+  const bool is_xtrans = filters == 9; 
+  const int colors = is_xtrans ? 3 : 4;
+  const int size = is_xtrans ? 6 : 16;
 
   float sum[4] = { 0.0f };
   float o[4] = { 0.0f };
 
-  global const int *ip = lookup[y % size][x % size];
-  const int num_pixels = ip[0];
-  ip++;
-
-  // for each adjoining pixel not of this pixel's color, sum up its weighted values
-  for(int i = 0; i < num_pixels; i++, ip += 3)
+  // approximate outermost single pixels
+  if(x < 1 || x >= width-1 || y < 1 || y >= height-1)
   {
-    const int offset = ip[0];
-    const int xx = (short)(offset & 0xffffu);
-    const int yy = (short)(offset >> 16);
-    const int idx = mad24(yy, stride, xx);
-    sum[ip[2]] += buffer[idx] * ip[1];
+    int count[4] = { 0 };
+    for(int j = y-1; j <= y+1; j++)
+    {
+      for(int i = x-1; i <= x+1; i++)
+      {
+        if(j >= 0 && i >= 0 && j < height && i < width)
+        {
+          const int f = fcol(j, i, filters, xtrans);
+          sum[f] += fmax(0.0f, readsingle(in, i, j));
+          count[f]++;
+        }
+      }
+    }
+    const int f = fcol(y, x, filters, xtrans);
+    // for current cell, copy the current sensor's color data,
+    // interpolate the other two colors from surrounding pixels of
+    // their color
+    for(int c = 0; c < colors; c++)
+    {
+      if(c != f && count[c] != 0)
+        o[c] = sum[c] / count[c];
+      else
+        o[c] = fmax(0.0f, readsingle(in, x, y));
+    }
+  }
+  else // do the bilinear stuff
+  {
+    global const int *ip = lookup[y % size][x % size];
+    const int num_pixels = ip[0];
+    ip++;
+
+    // for each adjoining pixel not of this pixel's color, sum up its weighted values
+    for(int i = 0; i < num_pixels; i++, ip += 3)
+    {
+      const int offset = ip[0];
+      const int xx = (short)(offset & 0xffffu);
+      const int yy = (short)(offset >> 16);
+      const int idx = mad24(yy, stride, xx);
+      sum[ip[2]] += buffer[idx] * ip[1];
+    }
+    // for each interpolated color, load it into the pixel
+    for(int i = 0; i < colors - 1; i++, ip += 2)
+    {
+      o[ip[0]] = sum[ip[0]] / ip[1];
+    }
+    o[ip[0]] = buffer[0];
   }
 
-  // for each interpolated color, load it into the pixel
-  for(int i = 0; i < colors - 1; i++, ip += 2)
+  if(only_linear && !is_xtrans)
   {
-    o[ip[0]] = sum[ip[0]] / ip[1];
+    o[1] = 0.5f * (o[1] + o[3]);
+    o[3] = 0.0f;
   }
-
-  o[ip[0]] = buffer[0];
-
-  write_imagef(out, (int2)(x, y), (float4)(o[0], o[1], o[2], o[3]));
+  write_imagef(out, (int2)(x, y), fmax(0.0f, (float4)(o[0], o[1], o[2], o[3])));
 }
 
 kernel void
-vng_interpolate(read_only image2d_t in, write_only image2d_t out, const int width, const int height,
+vng_interpolate(read_only image2d_t in,
+                write_only image2d_t out,
+                const int width,
+                const int height,
                 const unsigned int filters,
-                global const unsigned char (*const xtrans)[6], global const int (*const ips),
-                global const int (*const code)[16], local float *buffer)
+                global const unsigned char (*const xtrans)[6],
+                global const int (*const ips),
+                global const int (*const code)[16],
+                local float *buffer)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
@@ -178,7 +177,7 @@ vng_interpolate(read_only image2d_t in, write_only image2d_t out, const int widt
     if(bufidx >= maxbuf) continue;
     const int xx = xul + bufidx % stride;
     const int yy = yul + bufidx / stride;
-    float4 pixel = read_imagef(in, sampleri, (int2)(xx, yy));
+    const float4 pixel = readpixel(in, xx, yy);
     vstore4(pixel, bufidx, buffer);
   }
 
@@ -186,12 +185,25 @@ vng_interpolate(read_only image2d_t in, write_only image2d_t out, const int widt
   buffer += 4 * mad24(ylid + 2, stride, xlid + 2);
 
   barrier(CLK_LOCAL_MEM_FENCE);
+  if(x >= width || y >= height) return;
 
-  if(x < 2 || x >= width-2 || y < 2 || y >= height-2) return;
+  const bool is_xtrans = filters == 9;
+  // we don't touch data at the outermost 2 pixels
+  if(x < 2 || x >= width-2 || y < 2 || y >= height-2)
+  {
+    float4 val = readpixel(in, x, y);
+    if(!is_xtrans)
+    {
+      val.y = 0.5f * (val.y + val.w);
+      val.w = 0.0f;
+    }
+    write_imagef(out, (int2)(x, y), fmax(0.0f, val));
+    return;
+  }
 
-  const int colors = (filters == 9) ? 3 : 4;
-  const int prow = (filters == 9) ? 6 : 8;
-  const int pcol = (filters == 9) ? 6 : 2;
+  const int colors = is_xtrans ? 3 : 4;
+  const int prow = is_xtrans ? 6 : 8;
+  const int pcol = is_xtrans ? 6 : 2;
 
   float gval[8] = { 0.0f };
   int g;
@@ -234,9 +246,14 @@ vng_interpolate(read_only image2d_t in, write_only image2d_t out, const int widt
     if(gmax < gval[g]) gmax = gval[g];
   }
 
+  float o[4] = { 0.0f };
   if(gmax == 0.0f)
   {
-    write_imagef(out, (int2)(x, y), (float4)(fmax(0.0f, buffer[0]), fmax(0.0f, buffer[1]), fmax(0.0f, buffer[2]), fmax(0.0f, buffer[3])));
+    o[0] = buffer[0];
+    o[1] = is_xtrans ? buffer[1] : 0.5f * (buffer[1] + buffer[3]);
+    o[2] = buffer[2];
+    o[3] = 0.0f;
+    write_imagef(out, (int2)(x, y), fmax(0.0f, (float4)(o[0], o[1], o[2], o[3])));
     return;
   }
 
@@ -278,33 +295,16 @@ vng_interpolate(read_only image2d_t in, write_only image2d_t out, const int widt
   }
 
   // save to output
-  float o[4] = { 0.0f };
   for(int c = 0; c < colors; c++)
   {
     float tot = buffer[color];
     if(c != color) tot += (sum[c] - sum[color]) / num;
-    o[c] = fmax(0.0f, tot);
+    o[c] = tot;
   }
 
-  write_imagef(out, (int2)(x, y), (float4)(o[0], o[1], o[2], o[3]));
-}
-
-kernel void
-vng_green_equilibrate(read_only image2d_t in, write_only image2d_t out, const int width, const int height)
-{
-  // for Bayer mix the two greens to make VNG4
-
-  const int x = get_global_id(0);
-  const int y = get_global_id(1);
-
-  if(x >= width || y >= height) return;
-
-  float4 pixel = read_imagef(in, samplerA, (int2)(x , y));
-
-  pixel.y = (pixel.y + pixel.w) / 2.0f;
-  pixel.w = 0.0f;
-
-  write_imagef(out, (int2)(x, y), pixel);
+  o[1] = is_xtrans ? o[1] : 0.5f * (o[1] + o[3]);
+  o[3] = 0.0f;
+  write_imagef(out, (int2)(x, y), fmax(0.0f, (float4)(o[0], o[1], o[2], 0.0f)));
 }
 
 kernel void
@@ -344,14 +344,14 @@ clip_and_zoom_demosaic_third_size_xtrans(read_only image2d_t in, write_only imag
     {
       for(int j = 0; j < 3; j++)
         for(int i = 0; i < 3; i++)
-          col[FCxtrans(yy + j, xx + i, xtrans)] += read_imagef(in, sampleri, (int2)(xx + i, yy + j)).x;
+          col[FCxtrans(yy + j, xx + i, xtrans)] += fmax(0.0f, readsingle(in, xx + i, yy + j));
       num++;
     }
 
   // X-Trans RGB weighting averages to 2:5:2 for each 3x3 cell
-  col[0] = fmax(0.0f, col[0] / (num * 2));
-  col[1] = fmax(0.0f, col[1] / (num * 5));
-  col[2] = fmax(0.0f, col[2] / (num * 2));
+  col[0] = col[0] / (num * 2);
+  col[1] = col[1] / (num * 5);
+  col[2] = col[2] / (num * 2);
 
   write_imagef(out, (int2)(x, y), (float4)(col[0], col[1], col[2], 0.0f));
 }

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2013-2025 darktable developers.
+    Copyright (C) 2013-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -142,7 +142,7 @@ GSList *dt_masks_mouse_actions(const dt_masks_form_t *form)
 static void _set_hinter_message(const dt_masks_form_gui_t *gui,
                                 const dt_masks_form_t *form)
 {
-  char msg[256] = "";
+  char msg[512] = "";
 
   const int ftype = form->type;
 
@@ -319,6 +319,20 @@ static dt_masks_form_t *_group_from_module(const dt_develop_t *dev,
   return dt_masks_get_from_id(dev, module->blend_params->mask_id);
 }
 
+void dt_masks_register_forms(dt_develop_t *dev,
+                             GList *forms)
+{
+  for(GList *l = forms;
+      l;
+      l = g_list_next(l))
+  {
+    dt_masks_form_t *form = l->data;
+    dev->forms = g_list_append(dev->forms, form);
+  }
+
+  dt_dev_add_masks_history_item(dev, NULL, TRUE);
+}
+
 void dt_masks_gui_form_save_creation(dt_develop_t *dev,
                                      dt_iop_module_t *module,
                                      dt_masks_form_t *form,
@@ -420,7 +434,7 @@ int dt_masks_form_duplicate(dt_develop_t *dev, const dt_mask_id_t formid)
   darktable.develop->forms = g_list_append(dev->forms, fdest);
 
   // we copy all the points
-  if(fbase->functions)
+  if(fbase->functions && fbase->functions->duplicate_points)
     fbase->functions->duplicate_points(dev, fbase, fdest);
 
   // we save the form
@@ -456,7 +470,7 @@ int dt_masks_get_area(const dt_iop_module_t *module,
                       int *posx,
                       int *posy)
 {
-  if(form->functions)
+  if(form->functions && form->functions->get_area)
     return form->functions->get_area(module, piece, form, width, height, posx, posy);
 
   return 0;
@@ -475,7 +489,7 @@ int dt_masks_get_source_area(dt_iop_module_t *module,
   // must be a clone form
   if(form->type & DT_MASKS_CLONE)
   {
-    if(form->functions)
+    if(form->functions && form->functions->get_source_area)
       return form->functions->get_source_area(module, piece, form, width, height,
                                               posx, posy);
   }
@@ -852,6 +866,10 @@ dt_masks_form_t *dt_masks_create(const dt_masks_type_t type)
     form->functions = &dt_masks_functions_gradient;
   else if(type & DT_MASKS_GROUP)
     form->functions = &dt_masks_functions_group;
+#ifdef HAVE_AI
+  else if(type & DT_MASKS_OBJECT)
+    form->functions = &dt_masks_functions_object;
+#endif
 
   if(form->functions && form->functions->sanitize_config)
     form->functions->sanitize_config(type);
@@ -1112,7 +1130,8 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
     2. the mask manager and it is not expanded
 */
   const gboolean skipped = (module && !module->enabled)
-                        || (!module && !dt_lib_gui_get_expanded(dt_lib_get_module("masks")));
+                        && !dt_lib_gui_get_expanded(dt_lib_get_module("masks"));
+
   dt_print(DT_DEBUG_VERBOSE,
     "[dt_masks_events_mouse_moved] %s %s",
     module ? module->so->op : "mask manager",
@@ -1293,6 +1312,11 @@ void dt_masks_events_post_expose(const dt_iop_module_t *module,
 void dt_masks_clear_form_gui(const dt_develop_t *dev)
 {
   if(!dev->form_gui) return;
+  if(dev->form_gui->scratchpad_cleanup)
+  {
+    dev->form_gui->scratchpad_cleanup(dev->form_gui);
+    dev->form_gui->scratchpad_cleanup = NULL;
+  }
   g_list_free_full(dev->form_gui->points, dt_masks_form_gui_points_free);
   dev->form_gui->points = NULL;
   dt_masks_dynbuf_free(dev->form_gui->guipoints);
@@ -1389,11 +1413,16 @@ void dt_masks_reset_show_masks_icons(void)
   }
 }
 
-dt_masks_edit_mode_t dt_masks_get_edit_mode(dt_iop_module_t *module)
+dt_masks_edit_mode_t dt_masks_get_edit_mode(void)
 {
   return darktable.develop->form_gui
     ? darktable.develop->form_gui->edit_mode
     : DT_MASKS_EDIT_OFF;
+}
+
+gboolean dt_masks_is_restricted_mode(void)
+{
+  return dt_masks_get_edit_mode() == DT_MASKS_EDIT_RESTRICTED;
 }
 
 void dt_masks_set_edit_mode(dt_iop_module_t *module,
@@ -2320,7 +2349,7 @@ float dt_masks_drag_factor(dt_masks_form_gui_t *gui,
   gui->dx = xref - gui->posx;
   gui->dy = yref - gui->posy;
 
-  const float r = sqrtf(rx * rx + ry * ry);
+  const float r = dt_fast_hypotf(rx, ry);
   const float d = (rx * deltax + ry * deltay) / r;
   const float s = fmaxf(r > 0.0f ? (r + d) / r : 0.0f, 0.0f);
 
@@ -2345,7 +2374,7 @@ float dt_masks_change_rotation(const gboolean up,
                                const gboolean is_degree)
 {
   const float step = 40.f;
-  const float incr = is_degree ? 360.f / step : 2.0f * M_PI_F / step;
+  const float incr = is_degree ? 360.f / step : DT_2PI_F / step;
   const float max  = is_degree ? 360.0        : M_PI_F;
   const float v =
     up
@@ -2773,8 +2802,18 @@ void dt_masks_line_stroke(cairo_t *cr,
   dashed[1] /= zoom_scale;
   const int len = sizeof(dashed) / sizeof(dashed[0]);
 
+  double dashed_restricted[] = { DT_PIXEL_APPLY_DPI(8.0), DT_PIXEL_APPLY_DPI(12.0) };
+  dashed_restricted[0] /= zoom_scale;
+  dashed_restricted[1] /= zoom_scale;
+
+  const gboolean restricted = dt_masks_is_restricted_mode();
+
   // first the background draw, darker
-  dt_draw_set_color_overlay(cr, FALSE, selected ? 0.8 : 0.5);
+  if(restricted && !border)
+    dt_draw_set_color_overlay(cr, FALSE, 0.1);
+  else
+    dt_draw_set_color_overlay(cr, FALSE, selected ? 0.8 : 0.5);
+
   cairo_set_dash(cr, dashed, border ? len : 0, 0);
 
   const double lwidth = (dt_iop_canvas_not_sensitive(darktable.develop) ? 0.5 : 1.0) / zoom_scale;
@@ -2789,8 +2828,16 @@ void dt_masks_line_stroke(cairo_t *cr,
   // second the foreground draw, lighter (same size as darker if selected)
   cairo_set_line_width(cr, (line_width / (selected && !border ? 1.0 : 2.0)));
 
-  dt_draw_set_color_overlay(cr, TRUE, selected ? 0.9 : 0.6);
-  cairo_set_dash(cr, dashed, border ? len : 0, 4);
+  if(restricted && !border)
+  {
+    cairo_set_dash(cr, dashed_restricted, len, 4);
+    dt_draw_set_color_overlay(cr, TRUE, 1.0);
+  }
+  else if(!source)
+  {
+    dt_draw_set_color_overlay(cr, TRUE, selected ? 0.9 : 0.6);
+    cairo_set_dash(cr, dashed, border ? len : 0, 4);
+  }
 
   cairo_stroke(cr);
 }

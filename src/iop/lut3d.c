@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2019-2025 darktable developers.
+    Copyright (C) 2019-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -324,7 +324,7 @@ static void _correct_pixel_tetrahedral(const float *const in,
       rgbd[c] = rgbd[c] - rgbi[c]; // delta red/green/blue
     }
 
-  // indexes of P000 to P111 in clut
+    // indexes of P000 to P111 in clut
     const size_t color = rgbi[0] + rgbi[1] * level + rgbi[2] * level2;
     const size_t i000 = color * 3;                     // P000
     const size_t i100 = i000 + 3;                      // P100
@@ -459,7 +459,8 @@ static void _correct_pixel_pyramid(const float *const in,
 }
 
 #ifdef HAVE_GMIC
-static void _get_cache_filename(const char *const lutname, char *const cache_filename)
+static void _get_cache_filename(const char *const lutname,
+                                char *const cache_filename)
 {
   char *cache_dir = g_build_filename(g_get_user_cache_dir(), "gmic", NULL);
   char *cache_file = g_build_filename(cache_dir, lutname, NULL);
@@ -470,7 +471,8 @@ static void _get_cache_filename(const char *const lutname, char *const cache_fil
 }
 
 static uint8_t _calculate_clut_compressed(dt_iop_lut3d_params_t *const p,
-                                          const char *const filepath, float **clut)
+                                          const char *const filepath,
+                                          float **clut)
 {
   uint8_t level = DT_IOP_LUT3D_CLUT_LEVEL;
   float *lclut;
@@ -505,7 +507,8 @@ static uint8_t _calculate_clut_compressed(dt_iop_lut3d_params_t *const p,
 
 
 static uint16_t _calculate_clut_haldclut(dt_iop_lut3d_params_t *const p,
-                                         const char *const filepath, float **clut)
+                                         const char *const filepath,
+                                         float **clut)
 {
   dt_imageio_png_t png;
   if(!dt_imageio_png_read_header(filepath, &png))
@@ -1023,7 +1026,6 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   const int devid = piece->pipe->devid;
   const int width = roi_in->width;
   const int height = roi_in->height;
-  const size_t sizes[] = { ROUNDUPDWD(width, devid), ROUNDUPDHT(height, devid), 1 };
 
   if(clut && level)
   {
@@ -1042,13 +1044,14 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
        transform = FALSE;
     }
     if(transform)
-      dt_opencl_set_kernel_args(devid, kernel, 0, CLARG(dev_out));
+      // FIXME OPENCL is this safe here ?
+      err = dt_opencl_enqueue_kernel_2d_args(devid, kernel, width, height,
+              CLARG(dev_out), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(clut_cl), CLARG(level));
     else
-      dt_opencl_set_kernel_args(devid, kernel, 0, CLARG(dev_in));
-    dt_opencl_set_kernel_args(devid, kernel, 1, CLARG(dev_out), CLARG(width), CLARG(height), CLARG(clut_cl), CLARG(level));
-    err = dt_opencl_enqueue_kernel_2d(devid, kernel, sizes);
-    if(err != CL_SUCCESS)
-      goto cleanup;
+      err = dt_opencl_enqueue_kernel_2d_args(devid, kernel, width, height,
+              CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(clut_cl), CLARG(level));
+
+    if(err != CL_SUCCESS) goto cleanup;
 
     if(transform)
     {
@@ -1059,9 +1062,8 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   }
   else
   { // no lut: identity kernel
-    dt_opencl_set_kernel_args(devid, gd->kernel_lut3d_none, 0, CLARG(dev_in), CLARG(dev_out), CLARG(width),
-      CLARG(height));
-    err = dt_opencl_enqueue_kernel_2d(devid, gd->kernel_lut3d_none, sizes);
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_lut3d_none, width, height,
+      CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height));
   }
 
 cleanup:
@@ -1733,7 +1735,7 @@ void gui_init(dt_iop_module_t *self)
   gtk_tree_view_append_column((GtkTreeView *)g->lutname, col);
   GtkTreeSelection *selection = gtk_tree_view_get_selection((GtkTreeView *)g->lutname);
   gtk_tree_selection_set_mode(selection, GTK_SELECTION_SINGLE);
-  g->lutname_handler_id = g_signal_connect(G_OBJECT(selection), "changed", G_CALLBACK(_lutname_callback), self);
+  g->lutname_handler_id = g_signal_connect_data(G_OBJECT(selection), "changed", G_CALLBACK(_lutname_callback), self, NULL, 0);
   dt_gui_box_add(self->widget, g->lutwindow);
 
   g_signal_connect(G_OBJECT(g->lutentry), "changed", G_CALLBACK(_entry_callback), self);

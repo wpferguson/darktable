@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/module.h"
 #include "common/presets.h"
+#include "common/color_picker.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "dtgtk/button.h"
@@ -29,6 +30,7 @@
 #include "gui/drag_and_drop.h"
 #include "gui/gtk.h"
 #include "gui/presets.h"
+#include "gui/splash.h"
 #ifdef GDK_WINDOWING_QUARTZ
 #include "osx/osx.h"
 #endif
@@ -878,6 +880,14 @@ static void dt_lib_init_module(void *m)
   // do not init accelerators if there is no gui
   if(darktable.gui)
   {
+    dt_print(DT_DEBUG_VERBOSE, "loading utility module : %s",
+             module->plugin_name);
+    char *msg = g_strdup_printf(_("%s: %s"),
+                                _("loading utility modules"),
+                                module->name(module));
+    dt_splash_screen_set_progress(msg);
+    g_free(msg);
+
     module->gui_init(module);
 
     if(module->widget)
@@ -1508,7 +1518,7 @@ gchar *dt_lib_get_localized_name(const gchar *plugin_name)
 void dt_lib_colorpicker_set_box_area(dt_lib_t *lib,
                                      const dt_pickerbox_t box)
 {
-  if(!lib->proxy.colorpicker.module || !lib->proxy.colorpicker.set_sample_box_area) return;
+  if(!lib || !lib->proxy.colorpicker.module || !lib->proxy.colorpicker.set_sample_box_area) return;
   lib->proxy.colorpicker.set_sample_box_area(lib->proxy.colorpicker.module, box);
   gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
 }
@@ -1516,9 +1526,22 @@ void dt_lib_colorpicker_set_box_area(dt_lib_t *lib,
 void dt_lib_colorpicker_set_point(dt_lib_t *lib,
                                   const float pos[2])
 {
-  if(!lib->proxy.colorpicker.module || !lib->proxy.colorpicker.set_sample_point) return;
+  if(!lib || !lib->proxy.colorpicker.module || !lib->proxy.colorpicker.set_sample_point) return;
   lib->proxy.colorpicker.set_sample_point(lib->proxy.colorpicker.module, pos);
   gtk_widget_grab_focus(dt_ui_center(darktable.gui->ui));
+}
+
+/* clear color picker pos */
+void dt_lib_colorpicker_reset_box_area(dt_pickerbox_t box)
+{
+  dt_boundingbox_t reset = { 0.02f, 0.02f, 0.98f, 0.98f };
+  dt_color_picker_backtransform_box(darktable.develop, 2, reset, box);
+}
+
+void dt_lib_colorpicker_reset_point(dt_pickerpoint_t pos)
+{
+  dt_boundingbox_t reset = { 0.5f, 0.5f };
+  dt_color_picker_backtransform_box(darktable.develop, 1, reset, pos);
 }
 
 void dt_lib_colorpicker_setup(dt_lib_t *lib,
@@ -1526,12 +1549,55 @@ void dt_lib_colorpicker_setup(dt_lib_t *lib,
                               const gboolean pick_output)
 
 {
-  if(!lib->proxy.colorpicker.module || !lib->proxy.colorpicker.setup_sample) return;
+  if(!lib || !lib->proxy.colorpicker.module || !lib->proxy.colorpicker.setup_sample) return;
   lib->proxy.colorpicker.setup_sample(lib->proxy.colorpicker.module, denoise, pick_output);
+}
+
+void dt_lib_histogram_get_harmony(dt_lib_t *lib, dt_color_harmony_guide_t *guide)
+{
+  if(!lib || !lib->proxy.histogram.module || !lib->proxy.histogram.get_harmony) return;
+  lib->proxy.histogram.get_harmony(lib->proxy.histogram.module, guide);
+}
+
+void dt_lib_histogram_set_harmony(dt_lib_t *lib, const dt_color_harmony_guide_t *guide)
+{
+  if(!lib || !lib->proxy.histogram.module || !lib->proxy.histogram.set_harmony) return;
+  lib->proxy.histogram.set_harmony(lib->proxy.histogram.module, guide);
+}
+
+void dt_lib_histogram_set_harmony_callback(dt_lib_t *lib,
+    void (*cb)(const dt_color_harmony_guide_t *, void *), void *user_data)
+{
+  if(!lib || !lib->proxy.histogram.module || !lib->proxy.histogram.set_harmony_callback) return;
+  lib->proxy.histogram.set_harmony_callback(lib->proxy.histogram.module, cb, user_data);
+}
+
+void dt_lib_histogram_set_scope(dt_lib_t *lib, int scope)
+{
+  if(!lib || !lib->proxy.histogram.module || !lib->proxy.histogram.set_scope) return;
+  lib->proxy.histogram.set_scope(lib->proxy.histogram.module, scope);
+}
+
+void dt_lib_histogram_set_type(dt_lib_t *lib, int type)
+{
+  if(!lib || !lib->proxy.histogram.module || !lib->proxy.histogram.set_type) return;
+  lib->proxy.histogram.set_type(lib->proxy.histogram.module, type);
+}
+
+void dt_lib_histogram_get_sector_angles(dt_lib_t *lib,
+                                        const dt_color_harmony_type_t type,
+                                        const int rotation,
+                                        float *angles,
+                                        int *n)
+{
+  if(n) *n = 0;
+  if(!lib || !lib->proxy.histogram.module || !lib->proxy.histogram.get_sector_angles) return;
+  lib->proxy.histogram.get_sector_angles(lib->proxy.histogram.module, type, rotation, angles, n);
 }
 
 dt_lib_module_t *dt_lib_get_module(const char *name)
 {
+  if(!darktable.lib) return NULL;
   /* hide/show modules as last config */
   for(GList *iter = darktable.lib->plugins; iter; iter = g_list_next(iter))
   {

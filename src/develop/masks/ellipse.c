@@ -250,7 +250,7 @@ static float *_points_to_transform(const float xx,
   const int n = 10;
   const float lambda = (a - b) / (a + b);
   const int l = MAX(
-      100, (int)((M_PI * (a + b)
+      100, (int)((M_PI_F * (a + b)
                   * (1.0f + (3.0f * lambda * lambda)
                      / (10.0f + sqrtf(4.0f - 3.0f * lambda * lambda)))) / n));
 
@@ -272,16 +272,16 @@ static float *_points_to_transform(const float xx,
   points[4] = x - a * cosf(v);
   points[5] = y - a * sinf(v);
 
-  points[6] = x + b * cosf(v - M_PI_F / 2.0f);
-  points[7] = y + b * sinf(v - M_PI_F / 2.0f);
-  points[8] = x - b * cosf(v - M_PI_F / 2.0f);
-  points[9] = y - b * sinf(v - M_PI_F / 2.0f);
+  points[6] = x + b * cosf(v - M_PI_2f);
+  points[7] = y + b * sinf(v - M_PI_2f);
+  points[8] = x - b * cosf(v - M_PI_2f);
+  points[9] = y - b * sinf(v - M_PI_2f);
 
 
   DT_OMP_FOR_SIMD(if(l > 100) aligned(points:64))
   for(int i = 5; i < l + 5; i++)
   {
-    const float alpha = (i - 5) * 2.0 * M_PI / (float)l;
+    const float alpha = (i - 5) * DT_2PI_F / (float)l;
     points[i * 2] = x + a * cosf(alpha) * cosv - b * sinf(alpha) * sinv;
     points[i * 2 + 1] = y + a * cosf(alpha) * sinv + b * sinf(alpha) * cosv;
   }
@@ -1523,7 +1523,7 @@ static float *const _ellipse_points_to_transform(const float center_x,
 
   // how many points do we need ?
   const float lambda = (a - b) / (a + b);
-  const int l = (int)(M_PI * (a + b)
+  const int l = (int)(M_PI_F * (a + b)
                       * (1.0f + (3.0f * lambda * lambda)
                          / (10.0f + sqrtf(4.0f - 3.0f * lambda * lambda))));
 
@@ -1541,14 +1541,14 @@ static float *const _ellipse_points_to_transform(const float center_x,
   points[3] = y + a * sinf(v);
   points[4] = x - a * cosf(v);
   points[5] = y - a * sinf(v);
-  points[6] = x + b * cosf(v - M_PI_F / 2.0f);
-  points[7] = y + b * sinf(v - M_PI_F / 2.0f);
-  points[8] = x - b * cosf(v - M_PI_F / 2.0f);
-  points[9] = y - b * sinf(v - M_PI_F / 2.0f);
+  points[6] = x + b * cosf(v - M_PI_2f);
+  points[7] = y + b * sinf(v - M_PI_2f);
+  points[8] = x - b * cosf(v - M_PI_2f);
+  points[9] = y - b * sinf(v - M_PI_2f);
   // and finally the regularly-spaced points on the circumference
   for(int i = 5; i < l + 5; i++)
   {
-    const float alpha = (i - 5) * 2.0 * M_PI / (float)l;
+    const float alpha = (i - 5) * DT_2PI_F / (float)l;
     points[i * 2] = x + a * cosf(alpha) * cosv - b * sinf(alpha) * sinv;
     points[i * 2 + 1] = y + a * cosf(alpha) * sinv + b * sinf(alpha) * cosv;
   }
@@ -1805,7 +1805,7 @@ static int _ellipse_get_mask_roi(const dt_iop_module_t *const module,
   DT_OMP_FOR()
   for(int n = 0; n < ellpts; n++)
   {
-    const float phi = (2.0f * M_PI * n) / ellpts;
+    const float phi = (DT_2PI_F * n) / ellpts;
     const float cosp = cosf(phi);
     const float sinp = sinf(phi);
     ell[2 * n] = center[0] + ta * cosa * cosp - tb * sina * sinp;
@@ -2018,7 +2018,7 @@ static void _ellipse_set_hint_message(const dt_masks_form_gui_t *const gui,
     g_strlcat(msgbuf, _("<b>rotate</b>: ctrl+drag"), msgbuf_len);
   else if(gui->form_selected)
     g_snprintf(msgbuf, msgbuf_len,
-               _("<b>feather mode</b>: shift+click, <b>rotate</b>: ctrl+drag\n"
+               _("<b>feather mode</b>: alt+click, <b>rotate</b>: ctrl+drag\n"
                  "<b>size</b>: scroll, <b>feather size</b>: shift+scroll,"
                  " <b>opacity</b>: ctrl+scroll (%d%%)"), opacity);
 }

@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2021-2024 darktable developers.
+    Copyright (C) 2021-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -125,7 +125,7 @@ static void lmmse_demosaic(float *const restrict out,
                            const dt_iop_demosaic_lmmse_t mode,
                            const float scaler)
 {
-  rcd_ppg_border(out, in, width, height, filters, BORDER_AROUND);
+  demosaic_ppg(out, in, width, height, filters, 0.0f, BORDER_AROUND);
   if(width < 2 * BORDER_AROUND || height < 2 * BORDER_AROUND)
     return;
 
@@ -188,9 +188,9 @@ static void lmmse_demosaic(float *const restrict out,
         {
           float *cfa = qix[5] + rrr * DT_LMMSE_TILESIZE + BORDER_AROUND;
           int idx = row * width + colStart;
-          for(int ccc = BORDER_AROUND, col = colStart;
+          for(int ccc = BORDER_AROUND;
               ccc < tileCols + BORDER_AROUND;
-              ccc++, col++, cfa++, idx++)
+              ccc++, cfa++, idx++)
           {
             cfa[0] = _calc_gamma(revscaler * in[idx], lmmse_gamma_in);
           }
@@ -557,9 +557,9 @@ static void lmmse_demosaic(float *const restrict out,
           float *col2 = qix[2] + idx;
           for(int col = first_horizontal; col < last_horizontal; col++, dest +=4, col0++, col1++, col2++)
           {
-            dest[0] = scaler * _calc_gamma(col0[0], lmmse_gamma_out);
-            dest[1] = scaler * _calc_gamma(col1[0], lmmse_gamma_out);
-            dest[2] = scaler * _calc_gamma(col2[0], lmmse_gamma_out);
+            dest[0] = fmaxf(0.0f, scaler * _calc_gamma(col0[0], lmmse_gamma_out));
+            dest[1] = fmaxf(0.0f, scaler * _calc_gamma(col1[0], lmmse_gamma_out));
+            dest[2] = fmaxf(0.0f, scaler * _calc_gamma(col2[0], lmmse_gamma_out));
             dest[3] = 0.0f;
           }
         }

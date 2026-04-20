@@ -825,37 +825,37 @@ static float _exposure_proxy_get_effective_exposure(dt_iop_module_t *self)
   return g->effective_exposure;
 }
 
-static void _exposure_proxy_handle_event(gpointer controller,
-                                         int n_press,
-                                         double x,
-                                         const gboolean blackwhite)
+static void _exposure_proxy_handle_event(int n_press,
+                                         gdouble delta,
+                                         GdkModifierType state,
+                                         const gboolean is_blackpoint)
 {
-  dt_iop_module_t *self = darktable.develop->proxy.exposure.module;
+  const dt_iop_module_t *const self = darktable.develop->proxy.exposure.module;
   if(self && self->gui_data)
   {
-    static gboolean black = FALSE;
-    if((n_press > 0 && GTK_IS_GESTURE_SINGLE(controller)) // button press
-       || !n_press) // scroll event
-      black = blackwhite;
+    const dt_iop_exposure_params_t *const p = self->params;
+    const dt_iop_exposure_gui_data_t *const g = self->gui_data;
+    GtkWidget *const widget =
+      is_blackpoint ? g->black : (p->mode == EXPOSURE_MODE_DEFLICKER
+                                  ? g->deflicker_target_level : g->exposure);
+    const float val = dt_bauhaus_slider_get(widget);
+    const float accel = dt_accel_get_speed_multiplier(widget, state);
+    if(is_blackpoint)
+      delta = -delta;
 
-    if(black)
-      x *= -1;
-
-    const dt_iop_exposure_params_t *p = self->params;
-    dt_iop_exposure_gui_data_t *g = self->gui_data;
-    GtkWidget *widget = black ? g->black :
-                        p->mode == EXPOSURE_MODE_DEFLICKER
-                      ? g->deflicker_target_level : g->exposure;
-    if(!n_press)
-      darktable.bauhaus->scroll(widget, controller);
+    if(n_press == 2)
+      dt_bauhaus_widget_reset(widget);
+    else if(!n_press)
+    { // scroll
+      const float step = dt_bauhaus_slider_get_step(widget);
+      dt_bauhaus_slider_set(widget, val + delta * step * accel);
+    }
     else
-      if(GTK_IS_GESTURE_SINGLE(controller))
-        if(n_press > 0)
-          darktable.bauhaus->press(controller, n_press, x, 0, widget);
-        else
-          darktable.bauhaus->release(controller, -n_press, x, 0, widget);
-      else
-        darktable.bauhaus->motion(controller, x, 0, widget);
+    { // drag
+      const float s_min = dt_bauhaus_slider_get_soft_min(widget);
+      const float s_max = dt_bauhaus_slider_get_soft_max(widget);
+      dt_bauhaus_slider_set(widget, val + delta * (s_max - s_min) * accel);
+    }
 
     gchar *text = dt_bauhaus_slider_get_text(widget, dt_bauhaus_slider_get(widget));
     dt_action_widget_toast(DT_ACTION(self), widget, "%s", text);
@@ -915,7 +915,7 @@ static void _auto_set_exposure(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe)
     const float white = exposure2white(-expo);
 
     // apply the exposure compensation
-    dt_aligned_pixel_t XYZ_out;
+    dt_aligned_pixel_t XYZ_out = {0.0f };
     for(int c = 0; c < 3; c++)
       XYZ_out[c] = XYZ[c] * white;
 
